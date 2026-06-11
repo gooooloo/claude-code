@@ -5,7 +5,7 @@ import { LiveSessionView } from './components/LiveSessionView';
 import { RemoteSessionList } from './components/RemoteSessionList';
 import { SessionView } from './components/SessionView';
 import { ThemeToggle } from './components/ThemeToggle';
-import { type ConnectionConfig, loadConnections, saveConnections } from './lib/connections';
+import { type ConnectionConfig, loadConnections, mergeConnections, saveConnections } from './lib/connections';
 import { parseSessionFile } from './lib/jsonl';
 import type { RemoteSessionInfo } from './lib/protocol';
 import type { ParsedSession } from './lib/types';
@@ -127,6 +127,7 @@ export function App() {
           onRemoveConnection={id => setConnections(prev => prev.filter(c => c.id !== id))}
           onOpenConnection={connId => setView({ kind: 'remote-list', connId })}
           onOpenLocalSession={id => setView({ kind: 'local-session', id })}
+          onImportConnections={incoming => setConnections(prev => mergeConnections(prev, incoming))}
           onFiles={handleFiles}
         />
       )}

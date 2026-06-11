@@ -60,7 +60,7 @@ BINDINGS_FILE = os.path.join(
 def inject_keys(pid, keys, append_enter):
     """向目标控制台进程注入按键。非 Windows 平台返回 False。"""
     if ARGS and ARGS.dev_echo:
-        print(f"[dev-echo] inject pid={pid} enter={append_enter} keys={keys!r}")
+        print(f"[dev-echo] inject pid={pid} enter={append_enter} keys={keys!r}", flush=True)
         return True
     if not IS_WINDOWS:
         return False

@@ -1,5 +1,11 @@
 // 一次性图标生成脚本：手工光栅化品牌图标（橙底圆角方块 + 白色播放三角）
 // 用法：bun run packages/transcript-viewer/scripts/generate-icons.ts
+//
+// 注意：PNG 的 IDAT 必须是 zlib 包裹的 deflate（RFC1950，含 2 字节头 + Adler32 尾）。
+// 用 node:zlib 的 deflateSync 而非 Bun.deflateSync —— 后者产出的流头部不规范，
+// 浏览器宽容能显示，但 Rust image crate（Tauri 图标生成）会拒绝解码。
+
+import { deflateSync } from 'node:zlib'
 
 const ORANGE = [0xd9, 0x77, 0x06] as const
 const WHITE = [0xff, 0xff, 0xff] as const
@@ -92,7 +98,7 @@ function makePng(size: number): Uint8Array {
   dv.setUint32(4, size)
   ihdr[8] = 8 // bit depth
   ihdr[9] = 6 // RGBA
-  const idat = Bun.deflateSync(raw, { library: 'zlib' })
+  const idat = deflateSync(raw)
 
   const sig = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
   const parts = [
