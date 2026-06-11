@@ -1,0 +1,33 @@
+{
+  "name": "@claude-code-best/transcript-viewer",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Mobile-friendly local viewer for Claude Code JSONL session transcripts",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@radix-ui/react-collapsible": "^1.1.12",
+    "@radix-ui/react-use-controllable-state": "^1.2.2",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.555.0",
+    "react": "^19",
+    "react-dom": "^19",
+    "streamdown": "^1.6.8",
+    "tailwind-merge": "^3.3.1",
+    "use-stick-to-bottom": "^1.1.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.0.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0"
+  }
+}
