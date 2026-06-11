@@ -1,10 +1,12 @@
+import { CheckIcon, ShieldAlertIcon, XIcon } from 'lucide-react';
 import { useCallback, useMemo, useState } from 'react';
-import { sendInput } from '../lib/api';
+import { decidePermission, sendInput } from '../lib/api';
+import { clientId } from '../lib/clientId';
 import type { ConnectionConfig } from '../lib/connections';
 import type { PendingQuestion } from '../lib/jsonl/adapt';
-import { useLiveSession } from '../lib/liveSession';
+import { type PermissionView, useLiveSession } from '../lib/liveSession';
 import type { InputAction, RemoteSessionInfo } from '../lib/protocol';
-import { cn } from '../lib/utils';
+import { cn, truncate } from '../lib/utils';
 import { ChatView } from './chat/ChatView';
 import { InputBar } from './InputBar';
 
@@ -42,6 +44,25 @@ export function LiveSessionView({ conn, session }: LiveSessionViewProps) {
     [conn, session.projectKey, session.sessionId],
   );
 
+  const decide = useCallback(
+    async (permissionId: string, decision: 'allow' | 'deny') => {
+      setSendError(null);
+      const result = await decidePermission(
+        conn,
+        session.projectKey,
+        session.sessionId,
+        permissionId,
+        decision,
+        clientId(),
+      );
+      // 抢答失败不是错误：说明别的端先答了，UI 会随 resolved 事件置灰
+      if (!result.ok && result.error) {
+        setSendError(result.error);
+      }
+    },
+    [conn, session.projectKey, session.sessionId],
+  );
+
   const header =
     hiddenCount > 0 ? (
       <button
@@ -73,6 +94,15 @@ export function LiveSessionView({ conn, session }: LiveSessionViewProps) {
 
       <ChatView entries={visible} header={header} />
 
+      {/* 权限请求卡片（daemon canUseTool）—— 任意端可答，先到先得 */}
+      {live.permissions.length > 0 && (
+        <div className="border-t border-border bg-surface-1/60 px-4 py-3 backdrop-blur sm:px-8">
+          {live.permissions.map(permission => (
+            <PermissionCard key={permission.id} permission={permission} onDecide={decide} />
+          ))}
+        </div>
+      )}
+
       {/* AskUserQuestion 卡片 */}
       {live.pendingQuestions.length > 0 && (
         <div className="border-t border-border bg-surface-1/60 px-4 py-3 backdrop-blur sm:px-8">
@@ -98,6 +128,77 @@ export function LiveSessionView({ conn, session }: LiveSessionViewProps) {
       />
     </div>
   );
+}
+
+// =============================================================================
+// 权限请求卡片 —— 已解决则置灰显示"已由 X 处理"
+// =============================================================================
+
+function PermissionCard({
+  permission,
+  onDecide,
+}: {
+  permission: PermissionView;
+  onDecide: (permissionId: string, decision: 'allow' | 'deny') => void;
+}) {
+  const resolved = permission.resolved;
+  const title = permission.title ?? `允许使用 ${permission.toolName}?`;
+  const detail = permissionDetail(permission);
+
+  return (
+    <div
+      className={cn(
+        'mx-auto max-w-3xl rounded-xl border p-3',
+        resolved ? 'border-border opacity-60' : 'border-brand/40 bg-brand/5',
+      )}
+    >
+      <div className="flex items-start gap-2">
+        <ShieldAlertIcon className={cn('mt-0.5 size-4 flex-shrink-0', resolved ? 'text-text-muted' : 'text-brand')} />
+        <div className="min-w-0 flex-1">
+          <p className="font-display text-sm font-medium text-text-primary">{title}</p>
+          {detail && <p className="mt-0.5 break-all font-mono text-xs text-text-secondary">{truncate(detail, 300)}</p>}
+          {permission.description && <p className="mt-0.5 text-xs text-text-muted">{permission.description}</p>}
+        </div>
+      </div>
+
+      {resolved ? (
+        <p className="mt-2 text-xs text-text-muted">
+          已由 <span className="font-medium text-text-secondary">{resolved.by}</span>{' '}
+          {resolved.behavior === 'allow' ? '允许' : '拒绝'}
+        </p>
+      ) : (
+        <div className="mt-2.5 flex gap-2">
+          <button
+            type="button"
+            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-brand px-4 py-2 font-display text-sm font-medium text-white transition-opacity active:opacity-80"
+            onClick={() => onDecide(permission.id, 'allow')}
+          >
+            <CheckIcon className="size-4" />
+            允许
+          </button>
+          <button
+            type="button"
+            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-border px-4 py-2 font-display text-sm font-medium text-text-secondary transition-colors hover:border-status-error/40 hover:text-status-error"
+            onClick={() => onDecide(permission.id, 'deny')}
+          >
+            <XIcon className="size-4" />
+            拒绝
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** 从工具入参里挑最有信息量的一段作为详情（命令、文件路径等） */
+function permissionDetail(permission: PermissionView): string {
+  const input = permission.input;
+  if (!input) return '';
+  for (const key of ['command', 'file_path', 'path', 'url', 'pattern']) {
+    const value = input[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
 }
 
 // =============================================================================

@@ -2,6 +2,7 @@ import type { ConnectionConfig } from './connections'
 import type {
   InputAction,
   InputResponse,
+  PermissionDecisionResponse,
   ProcessCandidate,
   RemoteSessionInfo,
 } from './protocol'
@@ -80,6 +81,30 @@ export async function bindPid(
   )
   if (!res.ok) return { ok: false, error: `HTTP ${res.status}` }
   return (await res.json()) as InputResponse
+}
+
+export async function decidePermission(
+  conn: ConnectionConfig,
+  projectKey: string,
+  sessionId: string,
+  permissionId: string,
+  decision: 'allow' | 'deny',
+  clientId: string,
+): Promise<PermissionDecisionResponse> {
+  const res = await fetch(
+    buildUrl(
+      conn,
+      `api/session/${projectKey}/${sessionId}/permission/${permissionId}`,
+    ),
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision, clientId }),
+      signal: AbortSignal.timeout(15000),
+    },
+  )
+  if (!res.ok) return { ok: false, error: `HTTP ${res.status}` }
+  return (await res.json()) as PermissionDecisionResponse
 }
 
 export function streamUrl(

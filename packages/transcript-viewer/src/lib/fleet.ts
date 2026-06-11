@@ -45,7 +45,10 @@ export function useFleetStatus(
           online: true,
           sessionCount: sessions.length,
           attentionCount: sessions.filter(
-            s => s.state === 'elicitation' || s.state === 'plan_review',
+            s =>
+              s.state === 'elicitation' ||
+              s.state === 'plan_review' ||
+              s.state === 'permission',
           ).length,
         }
       } catch (err) {

@@ -2,10 +2,13 @@
 
 Claude Code 会话客户端，跨 iOS / iPad / Windows，从一处管理一支远程机器舰队。
 
-两种使用方式：
+三种使用方式：
 
 1. **本地查看**：导入 `~/.claude/projects/<项目>/<sessionId>.jsonl`，纯本地解析渲染（PWA，离线可用）。
-2. **远程实时（舰队）**：每台远端机器跑一个 `server/transcript_relay.py`（各自经 devtunnel 暴露）。客户端首页是舰队控制台：列出所有机器、显示在线状态与「等你回答」待办数（跨机汇总），点进任意机器看其会话列表，再点进会话即可实时查看、发送输入、回答 AskUserQuestion、中断 —— 控制的是远端 Windows Terminal 里真实的 TUI 会话。协议见 `server/protocol.md`。
+2. **远程只读/历史（relay）**：远端跑 `server/transcript_relay.py`，tail 已有 JSONL 经 devtunnel 推到客户端；输入靠按键注入裸 TUI。看历史会话最省事。
+3. **远程实时 + 结构化权限（daemon，推荐）**：远端跑 `server/bridge-daemon.ts`，用 Agent SDK 跑会话，权限走 `canUseTool` 结构化回调——**由 daemon 持有、广播全端、第一个客户端决定原子胜出**，彻底解决「本地 + 多端事先不知道谁先答」的并发问题。协议与对比见 `server/protocol.md`。
+
+客户端首页是**舰队控制台**：列出所有机器、在线状态、跨机汇总的「等你处理」待办数（含等你授权），点进机器看会话列表，再点进会话即可实时查看、发送输入、回答 AskUserQuestion、**批准/拒绝工具权限**、中断。
 
 > 十几台机器的连接配置（含 token）可在「导入 / 导出」里一次导出、在其他设备粘贴导入，三端共用一份。
 

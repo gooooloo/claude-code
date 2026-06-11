@@ -117,6 +117,7 @@ const STATE_STYLE: Record<RemoteSessionState, { label: string; className: string
   busy: { label: '运行中', className: 'bg-status-running/10 text-status-running' },
   elicitation: { label: '等你回答', className: 'bg-brand/15 text-brand' },
   plan_review: { label: '计划审批', className: 'bg-brand/15 text-brand' },
+  permission: { label: '等你授权', className: 'bg-brand/15 text-brand' },
   unknown: { label: '', className: '' },
 };
 

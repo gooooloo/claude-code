@@ -1,8 +1,24 @@
-# Transcript Relay 协议
+# 客户端 ↔ 远端服务端协议
 
-手机 App 与远端机器（跑 Claude Code 的 Windows/macOS/Linux）之间的通信协议。
-参考实现：`transcript_relay.py`（Python 3.8+ 标准库，单文件）。
+手机/桌面客户端与远端机器之间的通信协议。两种服务端，客户端协议兼容：
+
+| 服务端 | 文件 | 会话来源 | 输入 | 权限 |
+|---|---|---|---|---|
+| **relay** | `transcript_relay.py` | tail 已有 JSONL | 按键注入裸 TUI | 看不到（不写 JSONL） |
+| **daemon（推荐）** | `bridge-daemon.ts` | Agent SDK 跑会话 | SDK 流式输入 | **canUseTool 结构化、多端先到先得** |
+
 TypeScript 类型定义：`../src/lib/protocol.ts`。
+
+> **为什么有 daemon**：relay 驱动裸 Windows Terminal TUI，权限框不写进 JSONL、客户端看不见，
+> 且裸 TUI 的权限框无法让"本地 + 多端"对等作答（详见下文「权限并发」）。daemon 用 Agent SDK 的
+> `canUseTool` 把权限做成结构化回调，由 daemon 持有、广播全端、第一个客户端决定原子胜出——
+> 这正是 Happy / 官方 Remote Control 的做法。relay 仍适合"只读看历史 JSONL"。
+
+---
+
+# 一、Relay 协议（transcript_relay.py）
+
+参考实现：`transcript_relay.py`（Python 3.8+ 标准库，单文件）。
 
 ## 设计原则
 
@@ -107,3 +123,95 @@ App 端协议已预留：`RemoteSessionState` 可扩展 `permission_prompt`，�
 - 多 question 的 AskUserQuestion（一次最多 4 问）：TUI 内是 Tab 切换，目前逐问注入数字键的行为未在真机验证，自由文本回答总是可用的兜底。
 - `option` 注入的数字键选择假设 TUI 支持数字快捷键；不支持时改用方向键序列（服务端改 `inject_keys` 的翻译即可）。
 - SSE 经 devtunnel 的空闲超时未知，心跳 15s 应足够保活，必要时调小。
+
+> 上面的 A/B 是「坚持裸 TUI」时的退路。**推荐改用下面的 daemon**，从根上解决可见性与并发。
+
+---
+
+# 二、Daemon 协议（bridge-daemon.ts，推荐）
+
+参考实现：`bridge-daemon.ts`（Bun/TypeScript）。每台远端机器跑一份：
+
+```powershell
+bun run server/bridge-daemon.ts --token <密钥> --port 19860
+devtunnel host -p 19860 --allow-anonymous
+# 本机验证（不调真 SDK、不耗 API）：加 --mock
+```
+
+需要远端机器已登录 Claude Code（SDK 复用其登录态）。客户端「添加机器」填 devtunnel 域名 + 密钥，
+用法与 relay 完全一致——daemon 复用 relay 的 `GET /api/sessions`、`/stream`(snapshot/append/state)、
+`POST /input`，会话消息同样以 JSONL 行下发，客户端的链重建/渲染不变。差异只在多了**权限通道**。
+
+## 设计原则
+
+1. **daemon 拥有会话** —— 用 Agent SDK `query()` 跑 Claude Code，不是 tail 外部进程。
+2. **权限是回调返回值，不是按键** —— `canUseTool` 触发时，daemon 不在本地决定，而是登记一个待决请求、
+   广播给所有连接的客户端、`await` 第一个决定，再把它作为回调返回值交还 SDK。**因为是单一返回值，
+   不可能"双重生效"或漏进下一个框**（这正是按键注入做不到的）。
+3. **先到先得、原子、全端同步** —— 任意客户端（含本地 localhost 客户端）皆对等；第一个 POST 决定者
+   通过 compare-and-set 胜出，其余端收到 `permission_resolved` 即置灰显示"已由 X 处理"。
+
+## 新增端点 / 事件（在 relay 协议之上）
+
+### 会话状态新增 `permission`
+
+`state` 事件可取 `permission`（工具权限等待批准）。客户端把它和 `elicitation`/`plan_review` 一样
+计入「等你处理」待办。
+
+### SSE 新事件（在 `/stream` 上）
+
+```
+event: permission_request
+data: { "permission": { "id", "toolName", "title?", "displayName?", "description?",
+                        "input?", "toolUseID", "createdAt" } }
+
+event: permission_resolved
+data: { "id", "behavior": "allow"|"deny", "by": "<胜者客户端标识>" }
+```
+
+- 客户端**连接/重连时**，daemon 会把当前所有待决权限补发 `permission_request`，
+  保证新加入或刚 RDP 进来的端也能看到并抢答。
+- `permission_request` 按 `id` 去重（重连补发不重复）。
+
+### `POST /api/session/{projectKey}/{sessionId}/permission/{permissionId}`
+
+```json
+{ "decision": "allow"|"deny", "clientId": "<客户端标识，用于回显由谁处理>" }
+```
+
+返回：
+
+```json
+{ "ok": true }                              // 抢答成功
+{ "ok": false, "alreadyResolvedBy": "iPad-3f2a" }  // 已被别人抢先（非错误，UI 据 resolved 事件置灰）
+```
+
+仲裁是 daemon 单点、JS 单线程的 check-then-set，天然原子。胜者记入短期 `recentlyResolved`，
+让晚到的抢答 POST 也能回显正确的胜者。
+
+### `POST /api/sessions`（daemon 特有，从客户端起新会话）
+
+```json
+{ "prompt": "任务描述", "cwd": "可选工作目录" }   →   { "projectKey", "sessionId" }
+```
+
+## 权限并发 —— 为什么这样就对了
+
+场景：你管十几台机器，有时 RDP 进某台、有时在 iPhone/iPad/Windows 任意端，**事先不知道在哪个端先答**。
+
+| 不变量 | daemon 如何保证 |
+|---|---|
+| 答案只生效一次 | 权限是 `canUseTool` 的单一返回值；daemon 持有 resolver，只 resolve 一次 |
+| 任意端可答、对等 | 待决请求广播所有 SSE 订阅者；本地也是一个 localhost 客户端 |
+| 先到先得、原子 | 单点 check-then-set；第二个决定返回 `alreadyResolvedBy` |
+| 全端实时同步 | `permission_resolved` 广播，其余端即时置灰"已由 X 处理"，会话照常推进 |
+
+「裸 TUI 的原生权限框」无法成为并发响应者——这是 TUI 的硬限制，不是本设计的取舍。
+daemon 把权限移出 TUI、变成结构化回调，才换来真正对等的多端作答。
+
+## 已知边界
+
+- daemon 跑的会话不是你直接敲的裸 TUI；RDP 进机器时，在该机 localhost 开个客户端作答（与手机对称）。
+- `bridge-daemon.ts` 的真 SDK 路径（`startRealSession`）需在已登录 Claude Code 的机器上验证；
+  本仓库的端到端测试用 `--mock` 覆盖了协议 + 客户端 + 多端先到先得仲裁的完整闭环。
+- AskUserQuestion / ExitPlanMode 也可经同一 `canUseTool` 通道结构化呈现（当前 mock 演示了 Bash 权限）。
