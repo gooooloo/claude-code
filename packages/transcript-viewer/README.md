@@ -17,10 +17,15 @@ bun run build
 # 本地预览构建产物
 bun run preview
 
-# 原生 App（Capacitor）：web 构建后同步进 android/ 工程
-bunx --bun cap sync android
-# 出 APK 需要 Android SDK：在 Android Studio 打开 android/ 或 cd android && ./gradlew assembleDebug
+# 原生 App（Capacitor，iOS）：web 构建后同步进 ios/ 工程
+bunx --bun cap sync ios
+# 在 Xcode 打开并安装到 iPhone：
+bunx --bun cap open ios
+# 然后在 Xcode 里选你的设备 + 签名团队（免费 Apple ID 也可，7 天有效），Run。
 ```
+
+> 需要 Xcode 与 CocoaPods（`brew install cocoapods`）。iOS 平台用 Swift Package Manager 管理 Capacitor 插件。
+> 若要支持 Android，`bun add @capacitor/android && bunx --bun cap add android` 即可再生成。
 
 ### 远端服务（Windows 机器）
 
