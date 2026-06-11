@@ -24,11 +24,16 @@ import { getModelStrings, resolveOverriddenModel } from './modelStrings.js'
 import { formatModelPricing, getOpus46CostTier } from '../modelCost.js'
 import { getSettings_DEPRECATED } from '../settings/settings.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
-import { getAPIProvider } from './providers.js'
+import { getAPIProvider, isFirstPartyAnthropicBaseUrl } from './providers.js'
 import { LIGHTNING_BOLT } from '../../constants/figures.js'
 import { isModelAllowed } from './modelAllowlist.js'
 import { type ModelAlias, isModelAlias } from './aliases.js'
 import { capitalize } from '../stringUtils.js'
+import {
+  CHATGPT_CODEX_DEFAULT_MODEL,
+  CHATGPT_CODEX_FAST_MODEL,
+  isChatGPTAuthMode,
+} from './chatgptModels.js'
 
 export type ModelShortName = string
 export type ModelName = string
@@ -36,6 +41,9 @@ export type ModelSetting = ModelName | ModelAlias | null
 
 export function getSmallFastModel(): ModelName {
   const provider = getAPIProvider()
+  if (provider === 'openai' && isChatGPTAuthMode()) {
+    return process.env.OPENAI_SMALL_FAST_MODEL ?? CHATGPT_CODEX_FAST_MODEL
+  }
   // Provider-specific small fast model
   if (provider === 'openai' && process.env.OPENAI_SMALL_FAST_MODEL) {
     return process.env.OPENAI_SMALL_FAST_MODEL
@@ -112,9 +120,25 @@ export function getBestModel(): ModelName {
   return getDefaultOpusModel()
 }
 
+/**
+ * Resolve the provider's primary model from its env var (e.g. OPENAI_MODEL).
+ * Returns undefined for providers that don't have a primary-model env var
+ * (Bedrock, Vertex, Foundry, firstParty).
+ */
+function getProviderPrimaryModel(): ModelName | undefined {
+  const provider = getAPIProvider()
+  if (provider === 'openai') return process.env.OPENAI_MODEL
+  if (provider === 'gemini') return process.env.GEMINI_MODEL
+  if (provider === 'grok') return process.env.GROK_MODEL
+  return undefined
+}
+
 // @[MODEL LAUNCH]: Update the default Opus model (3P providers may lag so keep defaults unchanged).
 export function getDefaultOpusModel(): ModelName {
   const provider = getAPIProvider()
+  if (provider === 'openai' && isChatGPTAuthMode()) {
+    return CHATGPT_CODEX_DEFAULT_MODEL
+  }
   // For OpenAI provider, check OPENAI_DEFAULT_OPUS_MODEL first
   if (provider === 'openai' && process.env.OPENAI_DEFAULT_OPUS_MODEL) {
     return process.env.OPENAI_DEFAULT_OPUS_MODEL
@@ -127,10 +151,12 @@ export function getDefaultOpusModel(): ModelName {
   if (process.env.ANTHROPIC_DEFAULT_OPUS_MODEL) {
     return process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
   }
-  // 3P providers (Bedrock, Vertex, Foundry) all publish Opus 4.7 in sync
-  // with firstParty as of 2026-04-17 (AWS Bedrock, Google Vertex AI, and
-  // Microsoft Foundry announcements and model catalogs all confirm). The
-  // branch is kept as a structural hook in case a future launch lags on 3P.
+  // 3P providers: if user set a primary model (e.g. OPENAI_MODEL=glm-5.1),
+  // fall back to it instead of a hardcoded Anthropic model. This prevents
+  // sideQuery / background tasks from sending requests to Anthropic's API
+  // when the user configured a third-party provider.
+  const primaryModel = getProviderPrimaryModel()
+  if (primaryModel) return primaryModel
   if (provider !== 'firstParty') {
     return getModelStrings().opus47
   }
@@ -140,11 +166,11 @@ export function getDefaultOpusModel(): ModelName {
 // @[MODEL LAUNCH]: Update the default Sonnet model (3P providers may lag so keep defaults unchanged).
 export function getDefaultSonnetModel(): ModelName {
   const provider = getAPIProvider()
+  if (provider === 'openai' && isChatGPTAuthMode()) {
+    return CHATGPT_CODEX_DEFAULT_MODEL
+  }
   // For OpenAI provider, check OPENAI_DEFAULT_SONNET_MODEL first
-  if (
-    provider === 'openai' &&
-    process.env.OPENAI_DEFAULT_SONNET_MODEL
-  ) {
+  if (provider === 'openai' && process.env.OPENAI_DEFAULT_SONNET_MODEL) {
     return process.env.OPENAI_DEFAULT_SONNET_MODEL
   }
   // For Gemini provider, check GEMINI_DEFAULT_SONNET_MODEL
@@ -155,7 +181,11 @@ export function getDefaultSonnetModel(): ModelName {
   if (process.env.ANTHROPIC_DEFAULT_SONNET_MODEL) {
     return process.env.ANTHROPIC_DEFAULT_SONNET_MODEL
   }
-  // Default to Sonnet 4.5 for 3P since they may not have 4.6 yet
+  // 3P providers: fall back to user's primary model instead of a hardcoded
+  // Anthropic model name. Prevents background API calls from being routed to
+  // Anthropic when the user configured a third-party endpoint.
+  const primaryModel = getProviderPrimaryModel()
+  if (primaryModel) return primaryModel
   if (provider !== 'firstParty') {
     return getModelStrings().sonnet45
   }
@@ -165,6 +195,9 @@ export function getDefaultSonnetModel(): ModelName {
 // @[MODEL LAUNCH]: Update the default Haiku model (3P providers may lag so keep defaults unchanged).
 export function getDefaultHaikuModel(): ModelName {
   const provider = getAPIProvider()
+  if (provider === 'openai' && isChatGPTAuthMode()) {
+    return CHATGPT_CODEX_FAST_MODEL
+  }
   // For OpenAI provider, check OPENAI_DEFAULT_HAIKU_MODEL first
   if (provider === 'openai' && process.env.OPENAI_DEFAULT_HAIKU_MODEL) {
     return process.env.OPENAI_DEFAULT_HAIKU_MODEL
@@ -177,6 +210,10 @@ export function getDefaultHaikuModel(): ModelName {
   if (process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL) {
     return process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL
   }
+  // 3P providers: fall back to user's primary model instead of a hardcoded
+  // Anthropic model name.
+  const primaryModel = getProviderPrimaryModel()
+  if (primaryModel) return primaryModel
 
   // Haiku 4.5 is available on all platforms (first-party, Foundry, Bedrock, Vertex)
   return getModelStrings().haiku45
@@ -363,7 +400,8 @@ export function isOpus1mMergeEnabled(): boolean {
   if (
     is1mContextDisabled() ||
     isProSubscriber() ||
-    getAPIProvider() !== 'firstParty'
+    getAPIProvider() !== 'firstParty' ||
+    !isFirstPartyAnthropicBaseUrl()
   ) {
     return false
   }

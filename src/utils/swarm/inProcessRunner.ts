@@ -47,6 +47,7 @@ import {
 import type { CustomAgentDefinition } from '@claude-code-best/builtin-tools/tools/AgentTool/loadAgentsDir.js'
 import { runAgent } from '@claude-code-best/builtin-tools/tools/AgentTool/runAgent.js'
 import { awaitClassifierAutoApproval } from '@claude-code-best/builtin-tools/tools/BashTool/bashPermissions.js'
+import type { AgentToolResult } from '@claude-code-best/builtin-tools/tools/AgentTool/agentToolUtils.js'
 import { BASH_TOOL_NAME } from '@claude-code-best/builtin-tools/tools/BashTool/toolName.js'
 import { SEND_MESSAGE_TOOL_NAME } from '@claude-code-best/builtin-tools/tools/SendMessageTool/constants.js'
 import { TASK_CREATE_TOOL_NAME } from '@claude-code-best/builtin-tools/tools/TaskCreateTool/constants.js'
@@ -63,7 +64,10 @@ import {
 } from '../../utils/messages.js'
 import { evictTaskOutput } from '../../utils/task/diskOutput.js'
 import { evictTerminalTask } from '../../utils/task/framework.js'
-import { tokenCountWithEstimation } from '../../utils/tokens.js'
+import {
+  tokenCountWithEstimation,
+  getTokenCountFromUsage,
+} from '../../utils/tokens.js'
 import { createAbortController } from '../abortController.js'
 import { type AgentContext, runWithAgentContext } from '../agentContext.js'
 import {
@@ -97,7 +101,7 @@ import {
   getLastPeerDmSummary,
   isPermissionResponse,
   isShutdownRequest,
-  markMessageAsReadByIndex,
+  markMessageAsReadByIdentity,
   readMailbox,
   writeToMailbox,
 } from '../teammateMailbox.js'
@@ -405,10 +409,10 @@ function createInProcessCanUseTool(
             if (msg && !msg.read) {
               const parsed = isPermissionResponse(msg.text)
               if (parsed && parsed.request_id === request.id) {
-                await markMessageAsReadByIndex(
+                await markMessageAsReadByIdentity(
                   identity.agentName,
                   identity.teamName,
-                  i,
+                  msg,
                 )
                 if (parsed.subtype === 'success') {
                   processMailboxPermissionResponse({
@@ -674,6 +678,7 @@ type WaitResult =
       type: 'new_message'
       message: string
       autonomyRunId?: string
+      autonomyRootDir?: string
       from: string
       color?: string
       summary?: string
@@ -738,12 +743,16 @@ async function waitForNextPromptOrShutdown(
         `[inProcessRunner] ${identity.agentName} found pending user message (poll #${pollCount})`,
       )
       if (pending.autonomyRunId) {
-        await markAutonomyRunRunning(pending.autonomyRunId)
+        await markAutonomyRunRunning(
+          pending.autonomyRunId,
+          pending.autonomyRootDir,
+        )
       }
       return {
         type: 'new_message',
         message: pending.message,
         autonomyRunId: pending.autonomyRunId,
+        autonomyRootDir: pending.autonomyRootDir,
         from: 'user',
       }
     }
@@ -801,10 +810,10 @@ async function waitForNextPromptOrShutdown(
         logForDebugging(
           `[inProcessRunner] ${identity.agentName} received shutdown request from ${shutdownParsed?.from} (prioritized over ${skippedUnread} unread messages)`,
         )
-        await markMessageAsReadByIndex(
+        await markMessageAsReadByIdentity(
           identity.agentName,
           identity.teamName,
-          shutdownIndex,
+          msg,
         )
         return {
           type: 'shutdown_request',
@@ -839,10 +848,10 @@ async function waitForNextPromptOrShutdown(
           logForDebugging(
             `[inProcessRunner] ${identity.agentName} received new message from ${msg.from} (index ${selectedIndex})`,
           )
-          await markMessageAsReadByIndex(
+          await markMessageAsReadByIdentity(
             identity.agentName,
             identity.teamName,
-            selectedIndex,
+            msg,
           )
           return {
             type: 'new_message',
@@ -910,6 +919,7 @@ export async function runInProcessTeammate(
     invokingRequestId,
   } = config
   const { setAppState } = toolUseContext
+  const startTime = Date.now()
 
   logForDebugging(
     `[inProcessRunner] Starting agent loop for ${identity.agentId}`,
@@ -1021,6 +1031,7 @@ export async function runInProcessTeammate(
   )
   let currentPrompt = wrappedInitialPrompt
   let currentAutonomyRunId: string | undefined
+  let currentAutonomyRootDir: string | undefined
   let shouldExit = false
 
   // Try to claim an available task immediately so the UI can show activity
@@ -1246,8 +1257,13 @@ export async function runInProcessTeammate(
                 // Track in-progress tool use IDs for animation in transcript view
                 let inProgressToolUseIDs = task.inProgressToolUseIDs
                 if (message.type === 'assistant') {
-                  for (const block of (Array.isArray(message.message!.content) ? message.message!.content : [])) {
-                    if (typeof block !== 'string' && block.type === 'tool_use') {
+                  for (const block of Array.isArray(message.message!.content)
+                    ? message.message!.content
+                    : []) {
+                    if (
+                      typeof block !== 'string' &&
+                      block.type === 'tool_use'
+                    ) {
                       inProgressToolUseIDs = new Set([
                         ...(inProgressToolUseIDs ?? []),
                         block.id,
@@ -1318,12 +1334,21 @@ export async function runInProcessTeammate(
           setAppState,
         )
         if (currentAutonomyRunId) {
-          await markAutonomyRunFailed(currentAutonomyRunId, ERROR_MESSAGE_USER_ABORT)
+          await markAutonomyRunFailed(
+            currentAutonomyRunId,
+            ERROR_MESSAGE_USER_ABORT,
+            currentAutonomyRootDir,
+          )
           currentAutonomyRunId = undefined
+          currentAutonomyRootDir = undefined
         }
       } else if (currentAutonomyRunId) {
-        await markAutonomyRunCompleted(currentAutonomyRunId)
+        await markAutonomyRunCompleted(
+          currentAutonomyRunId,
+          currentAutonomyRootDir,
+        )
         currentAutonomyRunId = undefined
+        currentAutonomyRootDir = undefined
       }
 
       // Check if already idle before updating (to skip duplicate notification)
@@ -1397,6 +1422,7 @@ export async function runInProcessTeammate(
             setAppState,
           )
           currentAutonomyRunId = undefined
+          currentAutonomyRootDir = undefined
           break
 
         case 'new_message':
@@ -1409,6 +1435,7 @@ export async function runInProcessTeammate(
           if (waitResult.from === 'user') {
             currentPrompt = waitResult.message
             currentAutonomyRunId = waitResult.autonomyRunId
+            currentAutonomyRootDir = waitResult.autonomyRootDir
           } else {
             currentPrompt = formatAsTeammateMessage(
               waitResult.from,
@@ -1425,6 +1452,7 @@ export async function runInProcessTeammate(
               setAppState,
             )
             currentAutonomyRunId = undefined
+            currentAutonomyRootDir = undefined
           }
           break
 
@@ -1440,6 +1468,48 @@ export async function runInProcessTeammate(
     // Mark as completed when exiting the loop
     let alreadyTerminal = false
     let toolUseId: string | undefined
+
+    // Compute result so the detail dialog can show token usage.
+    // Walk backwards for the last API usage (cumulative input_tokens from the
+    // Anthropic API already includes all prior context).
+    let completionTokens = 0
+    let completionToolUseCount = 0
+    let lastAssistantContent: AgentToolResult['content'] = []
+    let lastUsage: AgentToolResult['usage'] | undefined
+    for (let i = allMessages.length - 1; i >= 0; i--) {
+      const m = allMessages[i]!
+      if (m.type === 'assistant') {
+        const blocks = (m.message?.content ?? []) as any[]
+        for (const b of blocks) {
+          if (b?.type === 'tool_use') completionToolUseCount++
+        }
+        const textBlocks = blocks.filter((b: any) => b?.type === 'text')
+        if (textBlocks.length > 0 && lastAssistantContent.length === 0) {
+          lastAssistantContent = textBlocks.map((b: any) => ({
+            type: 'text' as const,
+            text: b.text,
+          }))
+        }
+        if (!lastUsage && m.message?.usage) {
+          lastUsage = m.message.usage as AgentToolResult['usage']
+          completionTokens = getTokenCountFromUsage(
+            m.message.usage as Parameters<typeof getTokenCountFromUsage>[0],
+          )
+        }
+        if (completionTokens > 0 && lastAssistantContent.length > 0) break
+      }
+    }
+
+    const teammateResult: AgentToolResult = {
+      agentId: identity.agentId,
+      agentType: 'teammate',
+      content: lastAssistantContent,
+      totalToolUseCount: completionToolUseCount,
+      totalDurationMs: Date.now() - startTime,
+      totalTokens: completionTokens,
+      usage: lastUsage as AgentToolResult['usage'],
+    } as unknown as AgentToolResult
+
     updateTaskState(
       taskId,
       task => {
@@ -1458,6 +1528,7 @@ export async function runInProcessTeammate(
           status: 'completed' as const,
           notified: true,
           endTime: Date.now(),
+          result: teammateResult,
           messages: task.messages?.length ? [task.messages.at(-1)!] : undefined,
           pendingUserMessages: [],
           inProgressToolUseIDs: undefined,
@@ -1532,7 +1603,11 @@ export async function runInProcessTeammate(
       })
     }
     if (currentAutonomyRunId) {
-      await markAutonomyRunFailed(currentAutonomyRunId, errorMessage)
+      await markAutonomyRunFailed(
+        currentAutonomyRunId,
+        errorMessage,
+        currentAutonomyRootDir,
+      )
     }
 
     // Send idle notification with failure via file-based mailbox

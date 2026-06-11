@@ -20,7 +20,10 @@ import {
   type TextNode,
 } from './dom.js'
 import { Dispatcher } from './events/dispatcher.js'
-import { EVENT_HANDLER_PROPS } from './events/event-handlers.js'
+import {
+  EVENT_HANDLER_PROPS,
+  type EventHandlerProps,
+} from './events/event-handlers.js'
 import { getFocusManager, getRootNode } from './focus.js'
 import { LayoutDisplay } from './layout/node.js'
 import applyStyles, { type Styles, type TextStyles } from './styles.js'
@@ -34,8 +37,10 @@ if (process.env.NODE_ENV === 'development') {
     void import('./devtools.js')
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } catch (error: unknown) {
-    if (error instanceof Error && (error as NodeJS.ErrnoException).code === 'ERR_MODULE_NOT_FOUND') {
-      // biome-ignore lint/suspicious/noConsole: intentional warning
+    if (
+      error instanceof Error &&
+      (error as NodeJS.ErrnoException).code === 'ERR_MODULE_NOT_FOUND'
+    ) {
       console.warn(
         `
 The environment variable DEV is set to true, so Ink tried to import \`react-devtools-core\`,
@@ -109,7 +114,11 @@ type HostContext = {
   isInsideText: boolean
 }
 
-function setEventHandler(node: DOMElement, key: string, value: unknown): void {
+function setEventHandler<K extends keyof EventHandlerProps>(
+  node: DOMElement,
+  key: K,
+  value: EventHandlerProps[K],
+): void {
   if (!node._eventHandlers) {
     node._eventHandlers = {}
   }
@@ -133,7 +142,11 @@ function applyProp(node: DOMElement, key: string, value: unknown): void {
   }
 
   if (EVENT_HANDLER_PROPS.has(key)) {
-    setEventHandler(node, key, value)
+    setEventHandler(
+      node,
+      key as keyof EventHandlerProps,
+      value as EventHandlerProps[keyof EventHandlerProps],
+    )
     return
   }
 
@@ -197,7 +210,6 @@ let _prepareAt = 0
 
 /** Debug log helper — replaces fs.appendFileSync with console.warn. */
 function debugLog(message: string): void {
-  // biome-ignore lint/suspicious/noConsole: debug instrumentation
   console.warn(`[ink-commit] ${message}`)
 }
 // --- END ---
@@ -304,9 +316,7 @@ const reconciler = createReconciler<
     if (COMMIT_LOG) {
       const renderMs = performance.now() - _tr
       if (renderMs > 10) {
-        debugLog(
-          `${_tr.toFixed(1)} SLOW_PAINT ${renderMs.toFixed(1)}ms`,
-        )
+        debugLog(`${_tr.toFixed(1)} SLOW_PAINT ${renderMs.toFixed(1)}ms`)
       }
     }
   },
@@ -442,7 +452,11 @@ const reconciler = createReconciler<
         }
 
         if (EVENT_HANDLER_PROPS.has(key)) {
-          setEventHandler(node, key, value)
+          setEventHandler(
+            node,
+            key as keyof EventHandlerProps,
+            value as EventHandlerProps[keyof EventHandlerProps],
+          )
           continue
         }
 

@@ -10,13 +10,13 @@ export async function* adaptGeminiStreamToAnthropic(
   let started = false
   let stopped = false
   let nextContentIndex = 0
-  let openTextLikeBlock:
-    | { index: number; type: 'text' | 'thinking' }
-    | null = null
+  let openTextLikeBlock: { index: number; type: 'text' | 'thinking' } | null =
+    null
   let sawToolUse = false
   let finishReason: string | undefined
   let inputTokens = 0
   let outputTokens = 0
+  let cachedReadTokens = 0
 
   for await (const chunk of stream) {
     const usage = chunk.usageMetadata
@@ -24,6 +24,7 @@ export async function* adaptGeminiStreamToAnthropic(
       inputTokens = usage.promptTokenCount ?? inputTokens
       outputTokens =
         (usage.candidatesTokenCount ?? 0) + (usage.thoughtsTokenCount ?? 0)
+      cachedReadTokens = usage.cachedContentTokenCount ?? cachedReadTokens
     }
 
     if (!started) {
@@ -42,7 +43,7 @@ export async function* adaptGeminiStreamToAnthropic(
             input_tokens: inputTokens,
             output_tokens: 0,
             cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
+            cache_read_input_tokens: cachedReadTokens,
           },
         },
       } as unknown as BetaRawMessageStreamEvent
@@ -85,7 +86,10 @@ export async function* adaptGeminiStreamToAnthropic(
           } as BetaRawMessageStreamEvent
         }
 
-        if (part.functionCall.args && Object.keys(part.functionCall.args).length > 0) {
+        if (
+          part.functionCall.args &&
+          Object.keys(part.functionCall.args).length > 0
+        ) {
           yield {
             type: 'content_block_delta',
             index: toolIndex,
@@ -202,7 +206,10 @@ export async function* adaptGeminiStreamToAnthropic(
         stop_sequence: null,
       },
       usage: {
+        input_tokens: inputTokens,
         output_tokens: outputTokens,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: cachedReadTokens,
       },
     } as BetaRawMessageStreamEvent
 
@@ -213,9 +220,7 @@ export async function* adaptGeminiStreamToAnthropic(
   }
 }
 
-function getTextLikeBlockType(
-  part: GeminiPart,
-): 'text' | 'thinking' | null {
+function getTextLikeBlockType(part: GeminiPart): 'text' | 'thinking' | null {
   if (typeof part.text !== 'string') {
     return null
   }

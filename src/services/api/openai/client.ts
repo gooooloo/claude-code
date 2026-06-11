@@ -2,7 +2,6 @@ import OpenAI from 'openai'
 import { openaiAdapter } from 'src/services/providerUsage/adapters/openai.js'
 import { updateProviderBuckets } from 'src/services/providerUsage/store.js'
 import { getProxyFetchOptions } from 'src/utils/proxy.js'
-import { isEnvTruthy } from 'src/utils/envUtils.js'
 
 /**
  * Environment variables:
@@ -56,8 +55,12 @@ export function getOpenAIClient(options?: {
     maxRetries: options?.maxRetries ?? 0,
     timeout: parseInt(process.env.API_TIMEOUT_MS || String(600 * 1000), 10),
     dangerouslyAllowBrowser: true,
-    ...(process.env.OPENAI_ORG_ID && { organization: process.env.OPENAI_ORG_ID }),
-    ...(process.env.OPENAI_PROJECT_ID && { project: process.env.OPENAI_PROJECT_ID }),
+    ...(process.env.OPENAI_ORG_ID && {
+      organization: process.env.OPENAI_ORG_ID,
+    }),
+    ...(process.env.OPENAI_PROJECT_ID && {
+      project: process.env.OPENAI_PROJECT_ID,
+    }),
     fetchOptions: getProxyFetchOptions({ forAnthropicAPI: false }),
     fetch: wrappedFetch,
   })

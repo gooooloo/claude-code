@@ -6,7 +6,7 @@ import type {
   StreamEvent,
   SystemAPIErrorMessage,
 } from '../../../types/message.js'
-import { getEmptyToolPermissionContext, type Tools } from '../../../Tool.js'
+import { type Tools } from '../../../Tool.js'
 import { toolToAPISchema } from '../../../utils/api.js'
 import { logForDebugging } from '../../../utils/debug.js'
 import {
@@ -19,9 +19,20 @@ import type { SystemPrompt } from '../../../utils/systemPromptType.js'
 import type { ThinkingConfig } from '../../../utils/thinking.js'
 import type { Options } from '../claude.js'
 import { recordLLMObservation } from '../../../services/langfuse/tracing.js'
-import { convertMessagesToLangfuse, convertOutputToLangfuse, convertToolsToLangfuse } from '../../../services/langfuse/convert.js'
+import {
+  convertMessagesToLangfuse,
+  convertOutputToLangfuse,
+  convertToolsToLangfuse,
+} from '../../../services/langfuse/convert.js'
 import { streamGeminiGenerateContent } from './client.js'
-import { anthropicMessagesToGemini, resolveGeminiModel, adaptGeminiStreamToAnthropic, anthropicToolsToGemini, anthropicToolChoiceToGemini, GEMINI_THOUGHT_SIGNATURE_FIELD } from '@ant/model-provider'
+import {
+  anthropicMessagesToGemini,
+  resolveGeminiModel,
+  adaptGeminiStreamToAnthropic,
+  anthropicToolsToGemini,
+  anthropicToolChoiceToGemini,
+  GEMINI_THOUGHT_SIGNATURE_FIELD,
+} from '@ant/model-provider'
 
 export async function* queryModelGemini(
   messages: Message[],
@@ -103,7 +114,7 @@ export async function* queryModelGemini(
     const adaptedStream = adaptGeminiStreamToAnthropic(stream, geminiModel)
     const contentBlocks: Record<number, any> = {}
     const collectedMessages: AssistantMessage[] = []
-    let partialMessage: any = undefined
+    let partialMessage: any
     let ttftMs = 0
     const start = Date.now()
 
@@ -193,6 +204,15 @@ export async function* queryModelGemini(
       endTime: new Date(),
       completionStartTime: ttftMs > 0 ? new Date(start + ttftMs) : undefined,
       tools: convertToolsToLangfuse(toolSchemas as unknown[]),
+      thinking:
+        thinkingConfig.type !== 'disabled'
+          ? {
+              type: thinkingConfig.type,
+              ...(thinkingConfig.type === 'enabled' && {
+                budgetTokens: thinkingConfig.budgetTokens,
+              }),
+            }
+          : undefined,
     })
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error)
@@ -200,7 +220,9 @@ export async function* queryModelGemini(
     yield createAssistantAPIErrorMessage({
       content: `API Error: ${errorMessage}`,
       apiError: 'api_error',
-      error: (error instanceof Error ? error : new Error(String(error))) as unknown as SDKAssistantMessageError,
+      error: (error instanceof Error
+        ? error
+        : new Error(String(error))) as unknown as SDKAssistantMessageError,
     })
   }
 }

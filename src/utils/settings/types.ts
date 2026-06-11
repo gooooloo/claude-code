@@ -3,10 +3,7 @@ import { z } from 'zod/v4'
 import { SandboxSettingsSchema } from '../../entrypoints/sandboxTypes.js'
 import { isEnvTruthy } from '../envUtils.js'
 import { lazySchema } from '../lazySchema.js'
-import {
-  EXTERNAL_PERMISSION_MODES,
-  PERMISSION_MODES,
-} from '../permissions/PermissionMode.js'
+import { PERMISSION_MODES } from '../permissions/PermissionMode.js'
 import { MarketplaceSourceSchema } from '../plugins/schemas.js'
 import { CLAUDE_CODE_SETTINGS_SCHEMA_URL } from './constants.js'
 import { PermissionRuleSchema } from './permissionValidation.js'
@@ -57,11 +54,7 @@ export const PermissionsSchema = lazySchema(() =>
           'List of permission rules that should always prompt for confirmation',
         ),
       defaultMode: z
-        .enum(
-          feature('TRANSCRIPT_CLASSIFIER')
-            ? PERMISSION_MODES
-            : EXTERNAL_PERMISSION_MODES,
-        )
+        .enum(PERMISSION_MODES)
         .optional()
         .describe('Default permission mode when Claude Code needs access'),
       disableBypassPermissionsMode: z
@@ -559,9 +552,18 @@ export const SettingsSchema = lazySchema(() =>
           type: z.literal('command'),
           command: z.string(),
           padding: z.number().optional(),
+          refreshInterval: z.number().optional(),
         })
         .optional()
         .describe('Custom status line display configuration'),
+      // Toggle for the fork's built-in status line (BuiltinStatusLine + CachePill).
+      // Toggled by the /statusline command. Default false → no rendering.
+      statusLineEnabled: z
+        .boolean()
+        .optional()
+        .describe(
+          'Whether to render the fork built-in status line (model + ctx + 5h/7d limits + cost + cache pill). Toggled with /statusline.',
+        ),
       // Enabled plugins using marketplace-first format
       enabledPlugins: z
         .record(
@@ -880,6 +882,12 @@ export const SettingsSchema = lazySchema(() =>
               .boolean()
               .optional()
               .describe('Enable voice mode (hold-to-talk dictation)'),
+            voiceProvider: z
+              .enum(['anthropic', 'doubao'])
+              .optional()
+              .describe(
+                'Voice STT backend: "anthropic" (default) or "doubao" (Doubao ASR)',
+              ),
           }
         : {}),
       ...(feature('KAIROS')
@@ -1072,6 +1080,21 @@ export const SettingsSchema = lazySchema(() =>
             'Only applies to User, Project, and Local memory types (Managed/policy files cannot be excluded). ' +
             'Examples: "/home/user/monorepo/CLAUDE.md", "**/code/CLAUDE.md", "**/some-dir/.claude/rules/**"',
         ),
+      cacheThreshold: z
+        .number()
+        .int()
+        .min(0)
+        .max(100)
+        .optional()
+        .describe(
+          'Prompt cache hit rate threshold (0-100). Warnings shown when cache hit rate falls below this percentage. Default: 80.',
+        ),
+      cacheWarningEnabled: z
+        .boolean()
+        .optional()
+        .describe(
+          'Whether to show cache hit rate warnings in the message flow when the rate falls below cacheThreshold. Default: true.',
+        ),
       pluginTrustMessage: z
         .string()
         .optional()
@@ -1080,6 +1103,24 @@ export const SettingsSchema = lazySchema(() =>
             'Only read from policy settings (managed-settings.json / MDM). ' +
             'Useful for enterprise administrators to add organization-specific context ' +
             '(e.g., "All plugins from our internal marketplace are vetted and approved.").',
+        ),
+      /**
+       * Workspace API key stored in settings.json for /login UI convenience.
+       *
+       * ⚠️ SECURITY NOTICE: stored in plaintext in ~/.claude.json — ensure this
+       * file is gitignored and has restricted permissions (chmod 600 on POSIX).
+       * Use ANTHROPIC_API_KEY env var in CI/CD or shared environments instead.
+       *
+       * Must start with "sk-ant-api03-". Read via getGlobalConfig().workspaceApiKey
+       * or the ANTHROPIC_API_KEY env var (env var takes precedence).
+       */
+      workspaceApiKey: z
+        .string()
+        .optional()
+        .describe(
+          'Workspace API key (sk-ant-api03-*) saved via /login UI. ' +
+            'Stored in plaintext — keep this file gitignored and restrict its permissions. ' +
+            'ANTHROPIC_API_KEY environment variable takes precedence when both are set.',
         ),
     })
     .passthrough(),
@@ -1159,4 +1200,3 @@ export type PluginConfig = {
     [serverName: string]: UserConfigValues
   }
 }
-

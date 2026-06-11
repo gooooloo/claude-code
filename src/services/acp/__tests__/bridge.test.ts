@@ -4,7 +4,9 @@ import {
   toolUpdateFromToolResult,
   toolUpdateFromEditToolResponse,
   forwardSessionUpdates,
+  nextSdkMessageOrAbort,
 } from '../bridge.js'
+import { promptToQueryInput } from '../promptConversion.js'
 import { markdownEscape, toDisplayPath } from '../utils.js'
 import type { AgentSideConnection, ToolKind } from '@agentclientprotocol/sdk'
 import type { SDKMessage } from '../../../entrypoints/sdk/coreTypes.js'
@@ -27,6 +29,10 @@ async function* makeStream(
   msgs: SDKMessage[],
 ): AsyncGenerator<SDKMessage, void, unknown> {
   for (const m of msgs) yield m
+}
+
+async function* makeWaitingStream(): AsyncGenerator<SDKMessage, void, unknown> {
+  await new Promise<never>(() => {})
 }
 
 // ── toolInfoFromToolUse ────────────────────────────────────────────
@@ -336,6 +342,20 @@ describe('toolInfoFromToolUse', () => {
   })
 })
 
+describe('promptToQueryInput', () => {
+  test('uses shared prompt conversion for resource links', () => {
+    expect(
+      promptToQueryInput([
+        {
+          type: 'resource_link',
+          name: 'Spec',
+          uri: 'file:///tmp/spec.md',
+        } as any,
+      ]),
+    ).toBe('Resource link: name=Spec, uri=file:///tmp/spec.md')
+  })
+})
+
 // ── toolUpdateFromToolResult ───────────────────────────────────────
 
 describe('toolUpdateFromToolResult', () => {
@@ -467,7 +487,7 @@ describe('toolUpdateFromToolResult', () => {
         is_error: false,
         tool_use_id: 't1',
       },
-      { name: 'ToolSearch', id: 't1' },
+      { name: 'SearchExtraTools', id: 't1' },
     )
     expect(result.content).toEqual([
       { type: 'content', content: { type: 'text', text: 'Tool: some_tool' } },
@@ -677,6 +697,47 @@ describe('toDisplayPath', () => {
 
 // ── forwardSessionUpdates ─────────────────────────────────────────
 
+describe('nextSdkMessageOrAbort', () => {
+  test('returns done:true when aborted while waiting for next message', async () => {
+    const ac = new AbortController()
+    const pending = nextSdkMessageOrAbort(makeWaitingStream(), ac.signal)
+    ac.abort()
+
+    const result = await Promise.race([
+      pending,
+      new Promise<'timeout'>(resolve => setTimeout(resolve, 100, 'timeout')),
+    ])
+
+    expect(result).toEqual({ done: true, value: undefined })
+  })
+
+  test('returns done:true when stream is done', async () => {
+    const result = await nextSdkMessageOrAbort(
+      makeStream([]),
+      new AbortController().signal,
+    )
+
+    expect(result).toEqual({ done: true, value: undefined })
+  })
+
+  test('returns a valid SDKMessage via IteratorResult', async () => {
+    const msg = {
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'hello' }],
+      },
+    } as unknown as SDKMessage
+
+    const result = await nextSdkMessageOrAbort(
+      makeStream([msg]),
+      new AbortController().signal,
+    )
+
+    expect(result).toEqual({ done: false, value: msg })
+  })
+})
+
 describe('forwardSessionUpdates', () => {
   test('returns end_turn when stream is empty', async () => {
     const conn = makeConn()
@@ -707,6 +768,91 @@ describe('forwardSessionUpdates', () => {
       {},
     )
     expect(result.stopReason).toBe('cancelled')
+  })
+
+  test('cleans abort listeners when sdkMessages.next wins repeatedly', async () => {
+    const ac = new AbortController()
+    let abortListeners = 0
+    const add = ac.signal.addEventListener.bind(ac.signal)
+    const remove = ac.signal.removeEventListener.bind(ac.signal)
+    const addEventListener: AbortSignal['addEventListener'] = (
+      type: keyof AbortSignalEventMap,
+      listener: EventListenerOrEventListenerObject,
+      options?: boolean | AddEventListenerOptions,
+    ) => {
+      if (type === 'abort') abortListeners++
+      return add(type, listener, options)
+    }
+    const removeEventListener: AbortSignal['removeEventListener'] = (
+      type: keyof AbortSignalEventMap,
+      listener: EventListenerOrEventListenerObject,
+      options?: boolean | EventListenerOptions,
+    ) => {
+      if (type === 'abort') abortListeners--
+      return remove(type, listener, options)
+    }
+    ac.signal.addEventListener = addEventListener
+    ac.signal.removeEventListener = removeEventListener
+
+    const msgs = Array.from(
+      { length: 10_000 },
+      () =>
+        ({
+          type: 'system',
+          subtype: 'api_retry',
+        }) as unknown as SDKMessage,
+    )
+
+    const result = await forwardSessionUpdates(
+      's1',
+      makeStream(msgs),
+      makeConn(),
+      ac.signal,
+      {},
+    )
+
+    expect(result.stopReason).toBe('end_turn')
+    expect(abortListeners).toBe(0)
+  })
+
+  test('cleans abort listeners when abort wins the race', async () => {
+    const ac = new AbortController()
+    let abortListeners = 0
+    const add = ac.signal.addEventListener.bind(ac.signal)
+    const remove = ac.signal.removeEventListener.bind(ac.signal)
+    ac.signal.addEventListener = (
+      type: keyof AbortSignalEventMap,
+      listener: EventListenerOrEventListenerObject,
+      options?: boolean | AddEventListenerOptions,
+    ) => {
+      if (type === 'abort') abortListeners++
+      return add(type, listener, options)
+    }
+    ac.signal.removeEventListener = (
+      type: keyof AbortSignalEventMap,
+      listener: EventListenerOrEventListenerObject,
+      options?: boolean | EventListenerOptions,
+    ) => {
+      if (type === 'abort') abortListeners--
+      return remove(type, listener, options)
+    }
+
+    async function* never(): AsyncGenerator<SDKMessage, void, unknown> {
+      await new Promise(() => {})
+    }
+
+    const resultPromise = forwardSessionUpdates(
+      's1',
+      never(),
+      makeConn(),
+      ac.signal,
+      {},
+    )
+    ac.abort()
+    const result = await resultPromise
+
+    expect(result.stopReason).toBe('cancelled')
+    expect(abortListeners).toBe(0)
   })
 
   test('forwards assistant text message as agent_message_chunk', async () => {
@@ -765,6 +911,7 @@ describe('forwardSessionUpdates', () => {
 
   test('forwards tool_use block as tool_call', async () => {
     const conn = makeConn()
+    const input = { command: 'ls' }
     const msgs: SDKMessage[] = [
       {
         type: 'assistant',
@@ -774,7 +921,7 @@ describe('forwardSessionUpdates', () => {
               type: 'tool_use',
               id: 'tu_1',
               name: 'Bash',
-              input: { command: 'ls' },
+              input,
             },
           ],
           role: 'assistant',
@@ -794,6 +941,8 @@ describe('forwardSessionUpdates', () => {
     expect(update.toolCallId).toBe('tu_1')
     expect(update.kind).toBe('execute' as ToolKind)
     expect(update.status).toBe('pending')
+    expect(update.rawInput).toEqual(input)
+    expect(update.rawInput).not.toBe(input)
   })
 
   test('sends usage_update on result message with correct tokens', async () => {
@@ -972,6 +1121,28 @@ describe('forwardSessionUpdates', () => {
         >
       ).used,
     ).toBe(0)
+  })
+
+  test('ignores unknown message types without crashing', async () => {
+    const conn = makeConn()
+    const debug = console.debug
+    const debugMock = mock(() => {})
+    console.debug = debugMock as typeof console.debug
+
+    try {
+      const result = await forwardSessionUpdates(
+        's1',
+        makeStream([{ type: 'future_message' } as unknown as SDKMessage]),
+        conn,
+        new AbortController().signal,
+        {},
+      )
+
+      expect(result.stopReason).toBe('end_turn')
+      expect(debugMock).toHaveBeenCalled()
+    } finally {
+      console.debug = debug
+    }
   })
 
   test('re-throws unexpected errors from stream', async () => {

@@ -23,6 +23,28 @@ const inputSchema = lazySchema(() =>
       .array(z.string())
       .optional()
       .describe('Never include search results from these domains'),
+    num_results: z
+      .number()
+      .optional()
+      .describe('Number of search results to return (default: 8)'),
+    livecrawl: z
+      .enum(['fallback', 'preferred'])
+      .optional()
+      .describe(
+        "Live crawl mode - 'fallback': use live crawling as backup if cached content unavailable, 'preferred': prioritize live crawling (default: 'fallback')",
+      ),
+    search_type: z
+      .enum(['auto', 'fast', 'deep'])
+      .optional()
+      .describe(
+        "Search type - 'auto': balanced search (default), 'fast': quick results, 'deep': comprehensive search",
+      ),
+    context_max_characters: z
+      .number()
+      .optional()
+      .describe(
+        'Maximum characters for context string optimized for LLMs (default: 10000)',
+      ),
   }),
 )
 type InputSchema = ReturnType<typeof inputSchema>
@@ -31,7 +53,10 @@ const searchResultSchema = lazySchema(() => {
   const searchHitSchema = z.object({
     title: z.string().describe('The title of the search result'),
     url: z.string().describe('The URL of the search result'),
-    snippet: z.string().optional().describe('A short description of the search result'),
+    snippet: z
+      .string()
+      .optional()
+      .describe('A short description of the search result'),
   })
 
   return z.object({
@@ -148,6 +173,10 @@ export const WebSearchTool = buildTool({
     const adapterResults = await adapter.search(query, {
       allowedDomains: input.allowed_domains,
       blockedDomains: input.blocked_domains,
+      numResults: input.num_results,
+      livecrawl: input.livecrawl,
+      searchType: input.search_type,
+      contextMaxCharacters: input.context_max_characters,
       signal: context.abortController.signal,
       onProgress(progress) {
         if (onProgress) {
@@ -168,7 +197,11 @@ export const WebSearchTool = buildTool({
     if (adapterResults.length > 0) {
       results.push({
         tool_use_id: 'adapter-search-1',
-        content: adapterResults.map(r => ({ title: r.title, url: r.url, snippet: r.snippet })),
+        content: adapterResults.map(r => ({
+          title: r.title,
+          url: r.url,
+          snippet: r.snippet,
+        })),
       })
     } else {
       results.push('No search results found.')

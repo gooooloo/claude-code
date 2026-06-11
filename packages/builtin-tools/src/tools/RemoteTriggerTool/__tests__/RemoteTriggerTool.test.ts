@@ -1,55 +1,79 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { mkdir, readFile, rm } from 'fs/promises'
-import { tmpdir } from 'os'
-import { join } from 'path'
 import {
-  resetStateForTests,
-  setOriginalCwd,
-  setProjectRoot,
-} from 'src/bootstrap/state.js'
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  test,
+} from 'bun:test'
+import { authMock } from '../../../../../../tests/mocks/auth'
+import { setupAxiosMock } from '../../../../../../tests/mocks/axios'
 
 let requestStatus = 200
+const auditRecords: Record<string, unknown>[] = []
 
-mock.module('axios', () => ({
-  default: {
-    request: async () => ({
-      status: requestStatus,
-      data: { ok: requestStatus >= 200 && requestStatus < 300 },
-    }),
-  },
-}))
+const axiosHandle = setupAxiosMock()
+axiosHandle.stubs.request = async () => ({
+  status: requestStatus,
+  data: { ok: requestStatus >= 200 && requestStatus < 300 },
+})
 
-mock.module('src/utils/auth.js', () => ({
-  checkAndRefreshOAuthTokenIfNeeded: async () => {},
-  getClaudeAIOAuthTokens: () => ({ accessToken: 'token' }),
-}))
+beforeAll(() => {
+  axiosHandle.useStubs = true
+})
+afterAll(() => {
+  axiosHandle.useStubs = false
+})
+
+mock.module('src/utils/auth.js', authMock)
 
 mock.module('src/services/oauth/client.js', () => ({
   getOrganizationUUID: async () => 'org',
 }))
 
-mock.module('src/constants/oauth.js', () => ({
-  getOauthConfig: () => ({ BASE_API_URL: 'https://example.test' }),
+mock.module('src/services/analytics/growthbook.js', () => ({
+  getFeatureValue_CACHED_MAY_BE_STALE: () => true,
 }))
 
-let cwd = ''
-let previousCwd = ''
+mock.module('src/services/policyLimits/index.js', () => ({
+  isPolicyAllowed: () => true,
+}))
 
-beforeEach(async () => {
-  requestStatus = 200
-  previousCwd = process.cwd()
-  cwd = join(tmpdir(), `remote-trigger-tool-${Date.now()}-${Math.random().toString(16).slice(2)}`)
-  await mkdir(cwd, { recursive: true })
-  process.chdir(cwd)
-  resetStateForTests()
-  setOriginalCwd(cwd)
-  setProjectRoot(cwd)
+// Narrow mock for the side-effectful entries in `src/constants/oauth.js`.
+// Pure data exports (ALL_OAUTH_SCOPES, CLAUDE_AI_*_SCOPE, etc.) come from
+// the real module and are not mocked, per the test policy that constants
+// modules without side effects should not be replaced wholesale.
+mock.module('src/constants/oauth.js', () => {
+  const actual = require('../../../../../../src/constants/oauth.js')
+  return {
+    ...actual,
+    fileSuffixForOauthConfig: () => '',
+    getOauthConfig: () => ({ BASE_API_URL: 'https://example.test' }),
+    MCP_CLIENT_METADATA_URL: 'https://example.test/oauth/metadata',
+  }
 })
 
-afterEach(async () => {
-  resetStateForTests()
-  process.chdir(previousCwd)
-  await rm(cwd, { recursive: true, force: true })
+mock.module('src/utils/remoteTriggerAudit.js', () => ({
+  appendRemoteTriggerAuditRecord: async (record: Record<string, unknown>) => {
+    const fullRecord = {
+      auditId: `audit-${auditRecords.length + 1}`,
+      createdAt: Date.now(),
+      ...record,
+    }
+    auditRecords.push(fullRecord)
+    return fullRecord
+  },
+}))
+
+beforeEach(() => {
+  requestStatus = 200
+  auditRecords.length = 0
+})
+
+afterEach(() => {
+  auditRecords.length = 0
 })
 
 describe('RemoteTriggerTool audit', () => {
@@ -61,31 +85,30 @@ describe('RemoteTriggerTool audit', () => {
     )
 
     expect(result.data.audit_id).toBeString()
-    const raw = await readFile(
-      join(cwd, '.claude', 'remote-trigger-audit.jsonl'),
-      'utf-8',
-    )
-    expect(raw).toContain('"action":"run"')
-    expect(raw).toContain('"triggerId":"trigger-1"')
-    expect(raw).toContain('"ok":true')
+    expect(result.data.audit_id).toBe('audit-1')
+    expect(auditRecords).toHaveLength(1)
+    expect(auditRecords[0]).toMatchObject({
+      action: 'run',
+      triggerId: 'trigger-1',
+      ok: true,
+      status: 200,
+    })
   })
 
   test('writes an audit record before rethrowing validation failures', async () => {
     const { RemoteTriggerTool } = await import('../RemoteTriggerTool')
 
     await expect(
-      RemoteTriggerTool.call(
-        { action: 'run' },
-        { abortController: new AbortController() } as any,
-      ),
+      RemoteTriggerTool.call({ action: 'run' }, {
+        abortController: new AbortController(),
+      } as any),
     ).rejects.toThrow('run requires trigger_id')
 
-    const raw = await readFile(
-      join(cwd, '.claude', 'remote-trigger-audit.jsonl'),
-      'utf-8',
-    )
-    expect(raw).toContain('"action":"run"')
-    expect(raw).toContain('"ok":false')
-    expect(raw).toContain('run requires trigger_id')
+    expect(auditRecords).toHaveLength(1)
+    expect(auditRecords[0]).toMatchObject({
+      action: 'run',
+      ok: false,
+      error: 'run requires trigger_id',
+    })
   })
 })

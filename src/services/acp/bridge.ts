@@ -28,6 +28,7 @@ import { toDisplayPath, markdownEscape } from './utils.js'
 
 // ── ToolUseCache ──────────────────────────────────────────────────
 
+/** Maps tool_use_id → tool metadata for tracked inflight tool calls. */
 export type ToolUseCache = {
   [key: string]: {
     type: 'tool_use' | 'server_tool_use' | 'mcp_tool_use'
@@ -39,6 +40,7 @@ export type ToolUseCache = {
 
 // ── Session usage tracking ────────────────────────────────────────
 
+/** Accumulated token usage across a session, updated per result message. */
 export type SessionUsage = {
   inputTokens: number
   outputTokens: number
@@ -46,8 +48,139 @@ export type SessionUsage = {
   cachedWriteTokens: number
 }
 
+/** Token usage reported in SDK result messages. */
+type BridgeUsage = {
+  input_tokens?: number
+  output_tokens?: number
+  cache_read_input_tokens?: number
+  cache_creation_input_tokens?: number
+}
+
+/** system-init, compact_boundary, status, api_retry, local_command_output messages. */
+type BridgeSystemMessage = {
+  type: 'system'
+  subtype?: string
+  session_id?: string
+  content?: string
+  status?: string
+  compact_result?: string
+  compact_error?: string
+  model?: string
+  uuid?: string
+  [key: string]: unknown
+}
+
+/** Turn completion message: success with usage, or error with stop_reason. */
+type BridgeResultMessage = {
+  type: 'result'
+  subtype?: string
+  usage?: BridgeUsage
+  modelUsage?: Record<string, { contextWindow?: number }>
+  total_cost_usd?: number
+  is_error?: boolean
+  stop_reason?: string | null
+  result?: string
+  errors?: string[]
+  duration_ms?: number
+  duration_api_ms?: number
+  num_turns?: number
+  permission_denials?: unknown[]
+  session_id?: string
+  [key: string]: unknown
+}
+
+/** Full assistant response message after the turn completes. */
+type BridgeAssistantMessage = {
+  type: 'assistant'
+  message?: {
+    role?: string
+    id?: string
+    model?: string
+    content?: string | Array<Record<string, unknown>>
+    usage?: BridgeUsage | Record<string, unknown>
+    stop_reason?: string | null
+    [key: string]: unknown
+  }
+  parent_tool_use_id?: string | null
+  uuid?: string
+  session_id?: string
+  error?: unknown
+  [key: string]: unknown
+}
+
+/** Real-time streaming event (aka partial_assistant in the SDK schema). */
+type BridgeStreamEventMessage = {
+  type: 'stream_event'
+  event?: { type?: string; [key: string]: unknown }
+  message?: Record<string, unknown>
+  parent_tool_use_id?: string | null
+  session_id?: string
+  uuid?: string
+  [key: string]: unknown
+}
+
+/** User prompt message (may include tool_use_result from prior turns). */
+type BridgeUserMessage = {
+  type: 'user'
+  message?: Record<string, unknown>
+  uuid?: string
+  isReplay?: boolean
+  isMeta?: boolean
+  timestamp?: string
+  [key: string]: unknown
+}
+
+/** Subagent or hook progress notification (internal, not an SDK message member). */
+type BridgeProgressMessage = {
+  type: 'progress'
+  data?: {
+    type?: string
+    message?: Record<string, unknown>
+    [key: string]: unknown
+  }
+  [key: string]: unknown
+}
+
+/** Summary of tool calls made during a turn. */
+type BridgeToolUseSummaryMessage = {
+  type: 'tool_use_summary'
+  summary?: string
+  preceding_tool_use_ids?: string[]
+  uuid?: string
+  session_id?: string
+  [key: string]: unknown
+}
+
+/** File attachment metadata (internal, not an SDK message member). */
+type BridgeAttachmentMessage = {
+  type: 'attachment'
+  [key: string]: unknown
+}
+
+/** Compaction boundary marker (type is 'compact_boundary', not 'system'). */
+type BridgeCompactBoundaryMessage = {
+  type: 'compact_boundary'
+  compact_metadata?: Record<string, unknown>
+  [key: string]: unknown
+}
+
+/** ACP bridge local discriminated union — covers all message shapes consumed by the forwarding loop. */
+type BridgeSDKMessage =
+  | BridgeSystemMessage
+  | BridgeResultMessage
+  | BridgeAssistantMessage
+  | BridgeStreamEventMessage
+  | BridgeUserMessage
+  | BridgeProgressMessage
+  | BridgeToolUseSummaryMessage
+  | BridgeAttachmentMessage
+  | BridgeCompactBoundaryMessage
+
+const logger: { debug: (...args: unknown[]) => void } = console
+
 // ── Tool info conversion ──────────────────────────────────────────
 
+/** Sanitised tool metadata sent to ACP client for tool_call notifications. */
 interface ToolInfo {
   title: string
   kind: ToolKind
@@ -72,7 +205,12 @@ export function toolInfoFromToolUse(
         title: description,
         kind: 'think',
         content: prompt
-          ? [{ type: 'content' as const, content: { type: 'text' as const, text: prompt } }]
+          ? [
+              {
+                type: 'content' as const,
+                content: { type: 'text' as const, text: prompt },
+              },
+            ]
           : [],
       }
     }
@@ -86,7 +224,12 @@ export function toolInfoFromToolUse(
         content: _supportsTerminalOutput
           ? [{ type: 'terminal' as const, terminalId: toolUse.id }]
           : description
-            ? [{ type: 'content' as const, content: { type: 'text' as const, text: description } }]
+            ? [
+                {
+                  type: 'content' as const,
+                  content: { type: 'text' as const, text: description },
+                },
+              ]
             : [],
       }
     }
@@ -118,8 +261,20 @@ export function toolInfoFromToolUse(
         title: displayPath ? `Write ${displayPath}` : 'Write',
         kind: 'edit',
         content: filePath
-          ? [{ type: 'diff' as const, path: filePath, oldText: null, newText: content }]
-          : [{ type: 'content' as const, content: { type: 'text' as const, text: content } }],
+          ? [
+              {
+                type: 'diff' as const,
+                path: filePath,
+                oldText: null,
+                newText: content,
+              },
+            ]
+          : [
+              {
+                type: 'content' as const,
+                content: { type: 'text' as const, text: content },
+              },
+            ],
         locations: filePath ? [{ path: filePath }] : [],
       }
     }
@@ -133,7 +288,14 @@ export function toolInfoFromToolUse(
         title: displayPath ? `Edit ${displayPath}` : 'Edit',
         kind: 'edit',
         content: filePath
-          ? [{ type: 'diff' as const, path: filePath, oldText: oldString || null, newText: newString }]
+          ? [
+              {
+                type: 'diff' as const,
+                path: filePath,
+                oldText: oldString || null,
+                newText: newString,
+              },
+            ]
           : [],
         locations: filePath ? [{ path: filePath }] : [],
       }
@@ -164,7 +326,8 @@ export function toolInfoFromToolUse(
       if (input?.['-C'] !== undefined) label += ` -C ${input['-C'] as number}`
       if (input?.output_mode === 'files_with_matches') label += ' -l'
       else if (input?.output_mode === 'count') label += ' -c'
-      if (input?.head_limit !== undefined) label += ` | head -${input.head_limit as number}`
+      if (input?.head_limit !== undefined)
+        label += ` | head -${input.head_limit as number}`
       if (input?.glob) label += ` --include="${input.glob as string}"`
       if (input?.type) label += ` --type=${input.type as string}`
       if (input?.multiline) label += ' -P'
@@ -184,7 +347,12 @@ export function toolInfoFromToolUse(
         title: url ? `Fetch ${url}` : 'Fetch',
         kind: 'fetch',
         content: fetchPrompt
-          ? [{ type: 'content' as const, content: { type: 'text' as const, text: fetchPrompt } }]
+          ? [
+              {
+                type: 'content' as const,
+                content: { type: 'text' as const, text: fetchPrompt },
+              },
+            ]
           : [],
       }
     }
@@ -194,8 +362,10 @@ export function toolInfoFromToolUse(
       let label = `"${query}"`
       const allowed = input?.allowed_domains as string[] | undefined
       const blocked = input?.blocked_domains as string[] | undefined
-      if (allowed && allowed.length > 0) label += ` (allowed: ${allowed.join(', ')})`
-      if (blocked && blocked.length > 0) label += ` (blocked: ${blocked.join(', ')})`
+      if (allowed && allowed.length > 0)
+        label += ` (allowed: ${allowed.join(', ')})`
+      if (blocked && blocked.length > 0)
+        label += ` (blocked: ${blocked.join(', ')})`
       return {
         title: label,
         kind: 'fetch',
@@ -207,7 +377,7 @@ export function toolInfoFromToolUse(
       const todos = input?.todos as Array<{ content: string }> | undefined
       return {
         title: Array.isArray(todos)
-          ? `Update TODOs: ${todos.map((t) => t.content).join(', ')}`
+          ? `Update TODOs: ${todos.map(t => t.content).join(', ')}`
           : 'Update TODOs',
         kind: 'think',
         content: [],
@@ -215,12 +385,19 @@ export function toolInfoFromToolUse(
     }
 
     case 'ExitPlanMode': {
-      const plan = (input as Record<string, unknown>)?.plan as string | undefined
+      const plan = (input as Record<string, unknown>)?.plan as
+        | string
+        | undefined
       return {
         title: 'Ready to code?',
         kind: 'switch_mode',
         content: plan
-          ? [{ type: 'content' as const, content: { type: 'text' as const, text: plan } }]
+          ? [
+              {
+                type: 'content' as const,
+                content: { type: 'text' as const, text: plan },
+              },
+            ]
           : [],
       }
     }
@@ -240,7 +417,11 @@ export function toolUpdateFromToolResult(
   toolResult: Record<string, unknown>,
   toolUse: { name: string; id: string } | undefined,
   _supportsTerminalOutput: boolean = false,
-): { content?: ToolCallContent[]; title?: string; _meta?: Record<string, unknown> } {
+): {
+  content?: ToolCallContent[]
+  title?: string
+  _meta?: Record<string, unknown>
+} {
   if (!toolUse) return {}
 
   const isError = toolResult.is_error === true
@@ -261,7 +442,10 @@ export function toolUpdateFromToolResult(
           content: [
             {
               type: 'content' as const,
-              content: { type: 'text' as const, text: markdownEscape(resultContent) },
+              content: {
+                type: 'text' as const,
+                text: markdownEscape(resultContent),
+              },
             },
           ],
         }
@@ -272,7 +456,10 @@ export function toolUpdateFromToolResult(
             type: 'content' as const,
             content:
               c.type === 'text'
-                ? { type: 'text' as const, text: markdownEscape(c.text as string) }
+                ? {
+                    type: 'text' as const,
+                    text: markdownEscape(c.text as string),
+                  }
                 : toAcpContentBlock(c, false),
           })),
         }
@@ -290,10 +477,13 @@ export function toolUpdateFromToolResult(
         resultContent &&
         typeof resultContent === 'object' &&
         !Array.isArray(resultContent) &&
-        (resultContent as Record<string, unknown>).type === 'bash_code_execution_result'
+        (resultContent as Record<string, unknown>).type ===
+          'bash_code_execution_result'
       ) {
         const bashResult = resultContent as Record<string, unknown>
-        output = [bashResult.stdout, bashResult.stderr].filter(Boolean).join('\n')
+        output = [bashResult.stdout, bashResult.stderr]
+          .filter(Boolean)
+          .join('\n')
         exitCode = (bashResult.return_code as number) ?? (isError ? 1 : 0)
       } else if (typeof resultContent === 'string') {
         output = resultContent
@@ -311,7 +501,11 @@ export function toolUpdateFromToolResult(
           _meta: {
             terminal_info: { terminal_id: terminalId },
             terminal_output: { terminal_id: terminalId, data: output },
-            terminal_exit: { terminal_id: terminalId, exit_code: exitCode, signal: null },
+            terminal_exit: {
+              terminal_id: terminalId,
+              exit_code: exitCode,
+              signal: null,
+            },
           },
         }
       }
@@ -342,10 +536,7 @@ export function toolUpdateFromToolResult(
     }
 
     default: {
-      return toAcpContentUpdate(
-        resultContent ?? '',
-        isError,
-      )
+      return toAcpContentUpdate(resultContent ?? '', isError)
     }
   }
 }
@@ -411,8 +602,12 @@ function toAcpContentBlock(
     case 'tool_reference':
       return wrapText(`Tool: ${content.tool_name as string}`)
     case 'tool_search_tool_search_result': {
-      const refs = content.tool_references as Array<{ tool_name: string }> | undefined
-      return wrapText(`Tools found: ${refs?.map((r) => r.tool_name).join(', ') || 'none'}`)
+      const refs = content.tool_references as
+        | Array<{ tool_name: string }>
+        | undefined
+      return wrapText(
+        `Tools found: ${refs?.map(r => r.tool_name).join(', ') || 'none'}`,
+      )
     }
     case 'tool_search_tool_result_error':
       return wrapText(
@@ -428,7 +623,9 @@ function toAcpContentBlock(
       return wrapText(`Error: ${content.error_code as string}`)
     case 'code_execution_result':
     case 'bash_code_execution_result':
-      return wrapText(`Output: ${(content.stdout as string) || (content.stderr as string) || ''}`)
+      return wrapText(
+        `Output: ${(content.stdout as string) || (content.stderr as string) || ''}`,
+      )
     case 'code_execution_tool_result_error':
     case 'bash_code_execution_tool_result_error':
       return wrapText(`Error: ${content.error_code as string}`)
@@ -455,6 +652,7 @@ function toAcpContentBlock(
 
 // ── Edit tool response → diff ──────────────────────────────────────
 
+/** Context lines and diff metadata for one hunk of an Edit tool response. */
 interface EditToolResponseHunk {
   oldStart: number
   oldLines: number
@@ -463,6 +661,7 @@ interface EditToolResponseHunk {
   lines: string[]
 }
 
+/** Result block for Edit/Write tool responses containing hunks and optional file stats. */
 interface EditToolResponse {
   filePath?: string
   structuredPatch?: EditToolResponseHunk[]
@@ -508,34 +707,34 @@ export function toolUpdateFromEditToolResponse(toolResponse: unknown): {
     }
   }
 
-  const result: { content?: ToolCallContent[]; locations?: ToolCallLocation[] } = {}
+  const result: {
+    content?: ToolCallContent[]
+    locations?: ToolCallLocation[]
+  } = {}
   if (content.length > 0) result.content = content
   if (locations.length > 0) result.locations = locations
   return result
 }
 
-// ── Prompt conversion ─────────────────────────────────────────────
-
-/**
- * Convert ACP PromptRequest content blocks into content for QueryEngine.
- */
-export function promptToQueryContent(
-  prompt: Array<ContentBlock> | undefined,
-): string {
-  if (!prompt) return ''
-  return prompt
-    .map((block) => {
-      const b = block as Record<string, unknown>
-      if (b.type === 'text') return b.text as string
-      if (b.type === 'resource_link') return `[${b.name ?? ''}](${b.uri as string})`
-      if (b.type === 'resource') {
-        const resource = b.resource as Record<string, unknown> | undefined
-        if (resource && 'text' in resource) return resource.text as string
-      }
-      return ''
-    })
-    .filter(Boolean)
-    .join('\n')
+export function nextSdkMessageOrAbort(
+  sdkMessages: AsyncGenerator<SDKMessage, void, unknown>,
+  abortSignal: AbortSignal,
+): Promise<IteratorResult<SDKMessage, void>> {
+  if (abortSignal.aborted) {
+    return Promise.resolve({ done: true, value: undefined })
+  }
+  let abortHandler: (() => void) | undefined
+  const abortPromise = new Promise<IteratorResult<SDKMessage, void>>(
+    resolve => {
+      abortHandler = () => resolve({ done: true, value: undefined })
+      abortSignal.addEventListener('abort', abortHandler, { once: true })
+    },
+  )
+  return Promise.race([sdkMessages.next(), abortPromise]).finally(() => {
+    if (abortHandler) {
+      abortSignal.removeEventListener('abort', abortHandler)
+    }
+  })
 }
 
 // ── Main forwarding function ──────────────────────────────────────
@@ -567,34 +766,23 @@ export async function forwardSessionUpdates(
   let lastAssistantTotalUsage: number | null = null
   let lastAssistantModel: string | null = null
   let lastContextWindowSize = 200000
+  let streamingActive = false
 
   try {
     while (!abortSignal.aborted) {
       // Race the next message against the abort signal so we unblock
       // immediately when cancelled, even if the generator is waiting for
       // a slow API response.
-      const nextResult = await Promise.race([
-        sdkMessages.next(),
-        new Promise<IteratorResult<SDKMessage, void>>((resolve) => {
-          if (abortSignal.aborted) {
-            resolve({ done: true, value: undefined })
-            return
-          }
-          const handler = () => resolve({ done: true, value: undefined })
-          abortSignal.addEventListener('abort', handler, { once: true })
-        }),
-      ])
+      const nextResult = await nextSdkMessageOrAbort(sdkMessages, abortSignal)
       if (nextResult.done || abortSignal.aborted) break
-      const msg = nextResult.value
+      const rawMsg = nextResult.value
+      if (rawMsg == null) continue
+      const msg = rawMsg as BridgeSDKMessage
 
-      if (msg == null) continue
-
-      const type = msg.type as string
-
-      switch (type) {
+      switch (msg.type) {
         // ── System messages ────────────────────────────────────────
         case 'system': {
-          const subtype = msg.subtype as string | undefined
+          const subtype = msg.subtype
 
           if (subtype === 'compact_boundary') {
             // Reset assistant usage tracking after compaction
@@ -622,26 +810,19 @@ export async function forwardSessionUpdates(
 
         // ── Result messages ────────────────────────────────────────
         case 'result': {
-          const usage = msg.usage as
-            | {
-                input_tokens: number
-                output_tokens: number
-                cache_read_input_tokens: number
-                cache_creation_input_tokens: number
-              }
-            | undefined
+          const usage = msg.usage
 
           if (usage) {
-            accumulatedUsage.inputTokens += usage.input_tokens
-            accumulatedUsage.outputTokens += usage.output_tokens
-            accumulatedUsage.cachedReadTokens += usage.cache_read_input_tokens
-            accumulatedUsage.cachedWriteTokens += usage.cache_creation_input_tokens
+            accumulatedUsage.inputTokens += usage.input_tokens ?? 0
+            accumulatedUsage.outputTokens += usage.output_tokens ?? 0
+            accumulatedUsage.cachedReadTokens +=
+              usage.cache_read_input_tokens ?? 0
+            accumulatedUsage.cachedWriteTokens +=
+              usage.cache_creation_input_tokens ?? 0
           }
 
           // Resolve context window size from modelUsage via prefix matching
-          const modelUsage = msg.modelUsage as
-            | Record<string, { contextWindow?: number }>
-            | undefined
+          const modelUsage = msg.modelUsage
           if (modelUsage && lastAssistantModel) {
             const match = getMatchingModelUsage(modelUsage, lastAssistantModel)
             if (match?.contextWindow) {
@@ -651,29 +832,30 @@ export async function forwardSessionUpdates(
 
           // Send usage_update — use lastAssistantTotalUsage if available
           // (more accurate than accumulatedUsage which may include background tasks)
-          const usedTokens = lastAssistantTotalUsage ?? (
+          const usedTokens =
+            lastAssistantTotalUsage ??
             accumulatedUsage.inputTokens +
-            accumulatedUsage.outputTokens +
-            accumulatedUsage.cachedReadTokens +
-            accumulatedUsage.cachedWriteTokens
-          )
+              accumulatedUsage.outputTokens +
+              accumulatedUsage.cachedReadTokens +
+              accumulatedUsage.cachedWriteTokens
 
-          const totalCostUsd = msg.total_cost_usd as number | undefined
+          const totalCostUsd = msg.total_cost_usd
           await conn.sessionUpdate({
             sessionId,
             update: {
               sessionUpdate: 'usage_update',
               used: usedTokens,
               size: lastContextWindowSize,
-              cost: totalCostUsd != null
-                ? { amount: totalCostUsd, currency: 'USD' }
-                : undefined,
+              cost:
+                totalCostUsd != null
+                  ? { amount: totalCostUsd, currency: 'USD' }
+                  : undefined,
             },
           })
 
           // Determine stop reason
-          const subtype = msg.subtype as string | undefined
-          const isError = msg.is_error as boolean | undefined
+          const subtype = msg.subtype
+          const isError = msg.is_error
 
           if (abortSignal.aborted) {
             stopReason = 'cancelled'
@@ -682,7 +864,7 @@ export async function forwardSessionUpdates(
 
           switch (subtype) {
             case 'success': {
-              const stopReasonStr = msg.stop_reason as string | null
+              const stopReasonStr = msg.stop_reason
               if (stopReasonStr === 'max_tokens') {
                 stopReason = 'max_tokens'
               }
@@ -693,7 +875,7 @@ export async function forwardSessionUpdates(
               break
             }
             case 'error_during_execution': {
-              if ((msg.stop_reason as string | null) === 'max_tokens') {
+              if (msg.stop_reason === 'max_tokens') {
                 stopReason = 'max_tokens'
               } else if (isError) {
                 stopReason = 'end_turn'
@@ -730,6 +912,7 @@ export async function forwardSessionUpdates(
           for (const notification of notifications) {
             await conn.sessionUpdate(notification)
           }
+          streamingActive = true
           break
         }
 
@@ -737,15 +920,23 @@ export async function forwardSessionUpdates(
         case 'assistant': {
           // Track last assistant total usage for context window computation
           // (only for top-level messages, not subagents)
-          const assistantMsg = msg.message as Record<string, unknown> | undefined
-          const parentToolUseId = msg.parent_tool_use_id as string | null | undefined
+          const assistantMsg = msg.message
+          const parentToolUseId = msg.parent_tool_use_id
           if (assistantMsg?.usage && parentToolUseId === null) {
-            const msgUsage = assistantMsg.usage as Record<string, unknown>
+            const usage = assistantMsg.usage
             lastAssistantTotalUsage =
-              ((msgUsage.input_tokens as number) ?? 0) +
-              ((msgUsage.output_tokens as number) ?? 0) +
-              ((msgUsage.cache_read_input_tokens as number) ?? 0) +
-              ((msgUsage.cache_creation_input_tokens as number) ?? 0)
+              (typeof usage.input_tokens === 'number'
+                ? usage.input_tokens
+                : 0) +
+              (typeof usage.output_tokens === 'number'
+                ? usage.output_tokens
+                : 0) +
+              (typeof usage.cache_read_input_tokens === 'number'
+                ? usage.cache_read_input_tokens
+                : 0) +
+              (typeof usage.cache_creation_input_tokens === 'number'
+                ? usage.cache_creation_input_tokens
+                : 0)
           }
           // Track the current top-level model for context window size lookup
           if (
@@ -753,7 +944,7 @@ export async function forwardSessionUpdates(
             assistantMsg?.model &&
             assistantMsg.model !== '<synthetic>'
           ) {
-            lastAssistantModel = assistantMsg.model as string
+            lastAssistantModel = assistantMsg.model
           }
 
           const notifications = assistantMessageToAcpNotifications(
@@ -764,6 +955,8 @@ export async function forwardSessionUpdates(
             {
               clientCapabilities,
               cwd,
+              parentToolUseId,
+              streamingActive,
             },
           )
           for (const notification of notifications) {
@@ -781,15 +974,16 @@ export async function forwardSessionUpdates(
 
         // ── Progress messages ──────────────────────────────────────
         case 'progress': {
-          const progressData = msg.data as Record<string, unknown> | undefined
+          const progressData = msg.data
           if (!progressData) break
 
           // Handle agent/skill subagent progress
-          const progressType = progressData.type as string | undefined
-          if (progressType === 'agent_progress' || progressType === 'skill_progress') {
-            const progressMessage = progressData.message as
-              | Record<string, unknown>
-              | undefined
+          const progressType = progressData.type
+          if (
+            progressType === 'agent_progress' ||
+            progressType === 'skill_progress'
+          ) {
+            const progressMessage = progressData.message
             if (progressMessage) {
               const content = progressMessage.content as
                 | Array<Record<string, unknown>>
@@ -846,7 +1040,7 @@ export async function forwardSessionUpdates(
         }
 
         default:
-          // Ignore unknown message types
+          logger.debug('Ignoring unknown SDK message type')
           break
       }
     }
@@ -876,6 +1070,7 @@ function assistantMessageToAcpNotifications(
     clientCapabilities?: ClientCapabilities
     parentToolUseId?: string | null
     cwd?: string
+    streamingActive?: boolean
   },
 ): SessionNotification[] {
   const message = msg.message as Record<string, unknown> | undefined
@@ -900,7 +1095,27 @@ function assistantMessageToAcpNotifications(
     ]
   }
 
-  return toAcpNotifications(content, 'assistant', sessionId, toolUseCache, conn, undefined, options)
+  // When streaming is active, text/thinking were already sent via stream_event
+  // messages. Filter them out to avoid duplicate agent_message_chunk /
+  // agent_thought_chunk notifications. String content (synthetic messages)
+  // is unaffected — those have no corresponding stream_events.
+  const contentToProcess = options?.streamingActive
+    ? content.filter(
+        block => block.type !== 'text' && block.type !== 'thinking',
+      )
+    : content
+
+  if (contentToProcess.length === 0) return []
+
+  return toAcpNotifications(
+    contentToProcess,
+    'assistant',
+    sessionId,
+    toolUseCache,
+    conn,
+    undefined,
+    options,
+  )
 }
 
 // ── Stream event conversion ───────────────────────────────────────
@@ -913,6 +1128,7 @@ function streamEventToAcpNotifications(
   options?: {
     clientCapabilities?: ClientCapabilities
     cwd?: string
+    streamingActive?: boolean
   },
 ): SessionNotification[] {
   const event = (msg as unknown as { event: Record<string, unknown> }).event
@@ -920,7 +1136,9 @@ function streamEventToAcpNotifications(
 
   switch (event.type as string) {
     case 'content_block_start': {
-      const contentBlock = event.content_block as Record<string, unknown> | undefined
+      const contentBlock = event.content_block as
+        | Record<string, unknown>
+        | undefined
       if (!contentBlock) return []
       return toAcpNotifications(
         [contentBlock],
@@ -979,6 +1197,7 @@ function toAcpNotifications(
     clientCapabilities?: ClientCapabilities
     parentToolUseId?: string | null
     cwd?: string
+    streamingActive?: boolean
   },
 ): SessionNotification[] {
   const output: SessionNotification[] = []
@@ -1014,7 +1233,9 @@ function toAcpNotifications(
         if (source?.type === 'base64') {
           update = {
             sessionUpdate:
-              role === 'assistant' ? 'agent_message_chunk' : 'user_message_chunk',
+              role === 'assistant'
+                ? 'agent_message_chunk'
+                : 'user_message_chunk',
             content: {
               type: 'image',
               data: source.data as string,
@@ -1047,7 +1268,7 @@ function toAcpNotifications(
             | Array<{ content: string; status: string }>
             | undefined
           if (Array.isArray(todos)) {
-            const entries: PlanEntry[] = todos.map((todo) => ({
+            const entries: PlanEntry[] = todos.map(todo => ({
               content: todo.content,
               status: normalizePlanStatus(todo.status),
               priority: 'medium',
@@ -1059,12 +1280,7 @@ function toAcpNotifications(
           }
         } else {
           // Regular tool call
-          let rawInput: Record<string, unknown> | undefined
-          try {
-            rawInput = JSON.parse(JSON.stringify(toolInput ?? {}))
-          } catch {
-            // Ignore parse failures
-          }
+          const rawInput = toolInput ? { ...toolInput } : {}
 
           if (alreadyCached) {
             // Second encounter — send as tool_call_update
@@ -1104,8 +1320,7 @@ function toAcpNotifications(
 
       case 'tool_result':
       case 'mcp_tool_result': {
-        const toolUseId =
-          (chunk.tool_use_id as string | undefined) ?? ''
+        const toolUseId = (chunk.tool_use_id as string | undefined) ?? ''
         const toolUse = toolUseCache[toolUseId]
         if (!toolUse) break
 
@@ -1123,7 +1338,9 @@ function toAcpNotifications(
             toolCallId: toolUseId,
             sessionUpdate: 'tool_call_update',
             status:
-              (chunk.is_error as boolean | undefined) === true ? 'failed' : 'completed',
+              (chunk.is_error as boolean | undefined) === true
+                ? 'failed'
+                : 'completed',
             rawOutput: chunk.content,
             ...toolUpdate,
           }
@@ -1185,18 +1402,22 @@ export async function replayHistoryMessages(
   clientCapabilities?: ClientCapabilities,
   cwd?: string,
 ): Promise<void> {
-  for (const msg of messages) {
-    const type = msg.type as string
+  for (const rawMsg of messages) {
+    const msg = rawMsg as BridgeSDKMessage
     // Skip non-conversation messages
-    if (type !== 'user' && type !== 'assistant') continue
+    if (msg.type !== 'user' && msg.type !== 'assistant') {
+      logger.debug('Ignoring unknown SDK message type')
+      continue
+    }
     // Skip meta messages (synthetic continuation prompts)
     if (msg.isMeta === true) continue
 
-    const messageData = msg.message as Record<string, unknown> | undefined
+    const messageData = msg.message
     const content = messageData?.content
     if (!content) continue
 
-    const role: 'assistant' | 'user' = type === 'assistant' ? 'assistant' : 'user'
+    const role: 'assistant' | 'user' =
+      msg.type === 'assistant' ? 'assistant' : 'user'
 
     if (typeof content === 'string') {
       if (!content.trim()) continue
@@ -1252,5 +1473,5 @@ function getMatchingModelUsage(
     }
   }
 
-  return bestKey ? modelUsage[bestKey] ?? null : null
+  return bestKey ? (modelUsage[bestKey] ?? null) : null
 }

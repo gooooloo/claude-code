@@ -18,7 +18,10 @@ import type {
   NormalizedUserMessage,
 } from '../types/message.js'
 import { PERMISSION_MODES } from '../types/permissions.js'
-import { suppressNextSkillListing } from './attachments.js'
+import {
+  suppressNextSkillDiscovery,
+  suppressNextSkillListing,
+} from './attachments.js'
 import {
   copyFileHistoryForResume,
   type FileHistorySnapshot,
@@ -320,7 +323,10 @@ function detectTurnInterruption(
       return { kind: 'interrupted_turn' }
     }
     // Plain text user prompt — CC hadn't started responding
-    return { kind: 'interrupted_prompt', message: lastMessage as NormalizedUserMessage }
+    return {
+      kind: 'interrupted_prompt',
+      message: lastMessage as NormalizedUserMessage,
+    }
   }
 
   if (lastMessage.type === 'attachment') {
@@ -362,7 +368,13 @@ function isTerminalToolResult(
     const msgContent = msg.message!.content
     if (!Array.isArray(msgContent)) continue
     for (const b of msgContent) {
-      if (typeof b !== 'string' && 'type' in b && b.type === 'tool_use' && 'id' in b && b.id === toolUseId) {
+      if (
+        typeof b !== 'string' &&
+        'type' in b &&
+        b.type === 'tool_use' &&
+        'id' in b &&
+        b.id === toolUseId
+      ) {
         return (
           ('name' in b ? b.name : undefined) === BRIEF_TOOL_NAME ||
           ('name' in b ? b.name : undefined) === LEGACY_BRIEF_TOOL_NAME ||
@@ -387,7 +399,11 @@ export function restoreSkillStateFromMessages(messages: Message[]): void {
       continue
     }
     if (message.attachment!.type === 'invoked_skills') {
-      const skills = message.attachment!.skills as Array<{ name?: string; path?: string; content?: string }>;
+      const skills = message.attachment!.skills as Array<{
+        name?: string
+        path?: string
+        content?: string
+      }>
       for (const skill of skills) {
         if (skill.name && skill.path && skill.content) {
           // Resume only happens for the main session, so agentId is null
@@ -403,6 +419,16 @@ export function restoreSkillStateFromMessages(messages: Message[]): void {
       suppressNextSkillListing()
     }
   }
+
+  // Unconditionally suppress skill_listing and skill_discovery on resume.
+  // Attachments are not persisted to transcript for non-ant users
+  // (isLoggableMessage filters them out), so the per-type checks above may
+  // never find them even though the prior process already injected the content
+  // into the conversation via <system-reminder> blocks. Without this, every
+  // resume re-injects ~1K tokens of duplicate content and busts the Anthropic
+  // prompt cache prefix (which requires 100% byte-identical segments).
+  suppressNextSkillListing()
+  suppressNextSkillDiscovery()
 }
 
 /**

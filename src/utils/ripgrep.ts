@@ -4,9 +4,9 @@ import memoize from 'lodash-es/memoize.js'
 import { homedir } from 'os'
 import * as path from 'path'
 import { logEvent } from 'src/services/analytics/index.js'
-import { fileURLToPath } from 'url'
 import { isInBundledMode } from './bundledMode.js'
 import { logForDebugging } from './debug.js'
+import { distRoot } from './distRoot.js'
 import { isEnvDefinedFalsy } from './envUtils.js'
 import { execFileNoThrow } from './execFileNoThrow.js'
 import { findExecutable } from './findExecutable.js'
@@ -14,12 +14,10 @@ import { logError } from './log.js'
 import { getPlatform } from './platform.js'
 import { countCharInString } from './stringUtils.js'
 
-const __filename = fileURLToPath(import.meta.url)
-// we use node:path.join instead of node:url.resolve because the former doesn't encode spaces
-const __dirname = path.join(
-  __filename,
-  process.env.NODE_ENV === 'test' ? '../../../' : '../',
-)
+const __dirname = (() => {
+  if (process.env.NODE_ENV === 'test') return path.resolve(distRoot)
+  return distRoot
+})()
 
 type RipgrepConfig = {
   mode: 'system' | 'builtin' | 'embedded'
@@ -504,7 +502,7 @@ export const countFilesRoundedRg = memoize(
       if (count === 0) return 0
 
       const magnitude = Math.floor(Math.log10(count))
-      const power = Math.pow(10, magnitude)
+      const power = 10 ** magnitude
 
       // Round to nearest power of 10
       // e.g., 8 -> 10, 42 -> 100, 350 -> 100, 750 -> 1000

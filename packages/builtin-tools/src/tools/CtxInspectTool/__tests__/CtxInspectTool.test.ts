@@ -1,21 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { logMock } from '../../../../../../tests/mocks/log'
 
-mock.module('src/utils/log.ts', () => ({
-  logError: () => {},
-  logToFile: () => {},
-  getLogDisplayTitle: () => '',
-  logEvent: () => {},
-  logMCPError: () => {},
-  logMCPDebug: () => {},
-  dateToFilename: (d: Date) => d.toISOString().replace(/[:.]/g, '-'),
-  getLogFilePath: () => '/tmp/mock-log',
-  attachErrorLogSink: () => {},
-  getInMemoryErrors: () => [],
-  loadErrorLogs: async () => [],
-  getErrorLogByIndex: async () => null,
-  captureAPIRequest: () => {},
-  _resetErrorLogForTesting: () => {},
-}))
+mock.module('src/utils/log.ts', logMock)
 
 mock.module('src/services/tokenEstimation.ts', () => ({
   roughTokenCountEstimation: (text: string) => Math.ceil(text.length / 4),
@@ -166,7 +152,9 @@ describe('CtxInspectTool', () => {
       'total_tokens',
     ])
     expect(result.data.message_count).toBe(messages.length)
-    expect(result.data.total_tokens).toBe(tokenCountWithEstimation(messages as any))
+    expect(result.data.total_tokens).toBe(
+      tokenCountWithEstimation(messages as any),
+    )
     expect(result.data.context_window_model).toBe('claude-sonnet-4-6')
     expect(result.data.prompt_caching_enabled).toBe(true)
     expect(result.data.session_memory_enabled).toBe(false)

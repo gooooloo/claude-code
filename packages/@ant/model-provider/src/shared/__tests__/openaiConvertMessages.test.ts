@@ -121,7 +121,7 @@ describe('anthropicMessagesToOpenAI', () => {
     ])
   })
 
-  test('strips thinking blocks', () => {
+  test('preserves thinking blocks as reasoning_content', () => {
     const result = anthropicMessagesToOpenAI(
       [
         makeAssistantMsg([
@@ -131,7 +131,13 @@ describe('anthropicMessagesToOpenAI', () => {
       ],
       [] as any,
     )
-    expect(result).toEqual([{ role: 'assistant', content: 'visible response' }])
+    expect(result).toEqual([
+      {
+        role: 'assistant',
+        content: 'visible response',
+        reasoning_content: 'internal thoughts...',
+      },
+    ] as any)
   })
 
   test('handles full conversation with tools', () => {
@@ -299,7 +305,7 @@ describe('DeepSeek thinking mode (enableThinking)', () => {
     expect(assistant.reasoning_content).toBe('Let me reason about this...')
   })
 
-  test('drops thinking block when enableThinking is false (default)', () => {
+  test('preserves thinking block as reasoning_content even without enableThinking', () => {
     const result = anthropicMessagesToOpenAI(
       [
         makeAssistantMsg([
@@ -311,7 +317,7 @@ describe('DeepSeek thinking mode (enableThinking)', () => {
     )
     const assistant = result[0] as any
     expect(assistant.content).toBe('visible response')
-    expect(assistant.reasoning_content).toBeUndefined()
+    expect(assistant.reasoning_content).toBe('internal thoughts...')
   })
 
   test('preserves reasoning_content with tool_calls in same turn', () => {
@@ -352,7 +358,7 @@ describe('DeepSeek thinking mode (enableThinking)', () => {
     expect(assistant.tool_calls[0].function.name).toBe('get_weather')
   })
 
-  test('strips reasoning_content from previous turns', () => {
+  test('always preserves reasoning_content from all turns', () => {
     const result = anthropicMessagesToOpenAI(
       [
         // Turn 1: user → assistant (with thinking)
@@ -361,7 +367,8 @@ describe('DeepSeek thinking mode (enableThinking)', () => {
           { type: 'thinking' as const, thinking: 'Turn 1 reasoning...' },
           { type: 'text', text: 'Turn 1 answer' },
         ]),
-        // Turn 2: new user message → previous reasoning should be stripped
+        // Turn 2: new user message → reasoning should still be preserved
+        // (DeepSeek requires reasoning_content to be passed back when tool calls are involved)
         makeUserMsg('question 2'),
         makeAssistantMsg([
           { type: 'thinking' as const, thinking: 'Turn 2 reasoning...' },
@@ -373,10 +380,9 @@ describe('DeepSeek thinking mode (enableThinking)', () => {
     )
 
     const assistants = result.filter(m => m.role === 'assistant')
-    // Turn 1 assistant: reasoning should be stripped (previous turn)
-    expect((assistants[0] as any).reasoning_content).toBeUndefined()
+    // Both turns preserve reasoning_content (DeepSeek API requires it for tool calls)
+    expect((assistants[0] as any).reasoning_content).toBe('Turn 1 reasoning...')
     expect((assistants[0] as any).content).toBe('Turn 1 answer')
-    // Turn 2 assistant: reasoning should be preserved (current turn)
     expect((assistants[1] as any).reasoning_content).toBe('Turn 2 reasoning...')
     expect((assistants[1] as any).content).toBe('Turn 2 answer')
   })
@@ -462,7 +468,11 @@ describe('DeepSeek thinking mode (enableThinking)', () => {
     expect(assistant.reasoning_content).toBe('First thought.\nSecond thought.')
   })
 
-  test('skips empty thinking blocks', () => {
+  test('preserves empty thinking blocks as reasoning_content: "" (DeepSeek v4 thinking mode)', () => {
+    // DeepSeek v4 thinking mode sometimes returns reasoning_content: ""
+    // when the model answers directly without reasoning. The empty value
+    // must be echoed back in the next request — otherwise DeepSeek returns
+    // 400 ("reasoning_content ... must be passed back"). See issue #399.
     const result = anthropicMessagesToOpenAI(
       [
         makeUserMsg('question'),
@@ -475,7 +485,23 @@ describe('DeepSeek thinking mode (enableThinking)', () => {
       { enableThinking: true },
     )
     const assistant = result.filter(m => m.role === 'assistant')[0] as any
+    expect(assistant.reasoning_content).toBe('')
+    expect(assistant.content).toBe('Answer.')
+  })
+
+  test('omits reasoning_content when no thinking block is present', () => {
+    // No thinking block at all → no reasoning_content field on the
+    // OpenAI-format assistant message (relevant for non-thinking models).
+    const result = anthropicMessagesToOpenAI(
+      [
+        makeUserMsg('question'),
+        makeAssistantMsg([{ type: 'text', text: 'Answer.' }]),
+      ],
+      [] as any,
+    )
+    const assistant = result.filter(m => m.role === 'assistant')[0] as any
     expect(assistant.reasoning_content).toBeUndefined()
+    expect(assistant.content).toBe('Answer.')
   })
 
   // ── fix: reorder tool and user messages for OpenAI API compatibility (#168) ──
@@ -487,10 +513,19 @@ describe('DeepSeek thinking mode (enableThinking)', () => {
       [
         makeUserMsg('run ls'),
         makeAssistantMsg([
-          { type: 'tool_use' as const, id: 'toolu_1', name: 'bash', input: { command: 'ls' } },
+          {
+            type: 'tool_use' as const,
+            id: 'toolu_1',
+            name: 'bash',
+            input: { command: 'ls' },
+          },
         ]),
         makeUserMsg([
-          { type: 'tool_result' as const, tool_use_id: 'toolu_1', content: 'file.txt' },
+          {
+            type: 'tool_result' as const,
+            tool_use_id: 'toolu_1',
+            content: 'file.txt',
+          },
           { type: 'text' as const, text: 'looks good' },
         ]),
       ],
@@ -499,7 +534,10 @@ describe('DeepSeek thinking mode (enableThinking)', () => {
     // Find the tool message and the user text message
     const toolIdx = result.findIndex(m => m.role === 'tool')
     const userTextIdx = result.findIndex(
-      m => m.role === 'user' && typeof m.content === 'string' && m.content.includes('looks good'),
+      m =>
+        m.role === 'user' &&
+        typeof m.content === 'string' &&
+        m.content.includes('looks good'),
     )
     expect(toolIdx).toBeGreaterThanOrEqual(0)
     expect(userTextIdx).toBeGreaterThanOrEqual(0)
@@ -512,15 +550,26 @@ describe('DeepSeek thinking mode (enableThinking)', () => {
       [
         makeUserMsg('do something'),
         makeAssistantMsg([
-          { type: 'tool_use' as const, id: 'toolu_2', name: 'bash', input: { command: 'pwd' } },
+          {
+            type: 'tool_use' as const,
+            id: 'toolu_2',
+            name: 'bash',
+            input: { command: 'pwd' },
+          },
         ]),
         makeUserMsg([
-          { type: 'tool_result' as const, tool_use_id: 'toolu_2', content: '/home/user' },
+          {
+            type: 'tool_result' as const,
+            tool_use_id: 'toolu_2',
+            content: '/home/user',
+          },
         ]),
       ],
       [] as any,
     )
-    const assistantIdx = result.findIndex(m => m.role === 'assistant' && (m as any).tool_calls)
+    const assistantIdx = result.findIndex(
+      m => m.role === 'assistant' && (m as any).tool_calls,
+    )
     const toolIdx = result.findIndex(m => m.role === 'tool')
     expect(assistantIdx).toBeGreaterThanOrEqual(0)
     expect(toolIdx).toBe(assistantIdx + 1)

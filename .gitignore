@@ -5,7 +5,8 @@ coverage
 .env
 *.log
 .idea
-.vscode
+.vscode/*
+!.vscode/extensions.json
 *.suo
 *.lock
 src/utils/vendor/
@@ -43,3 +44,15 @@ data
 .codex/skills/.system/**
 !.codex/prompts/
 !.codex/prompts/**
+teach-me
+credentials.json
+
+# Session-scoped progress / state files written by agents and skills
+# (autofix-pr persistence, test-progress checkpoint, recovery notes).
+# Transient, never meant to enter the repo.
+.claude-impl-state.md
+.claude-progress.md
+.claude-recovery.md
+.test-progress.md
+.squash-tmp/
+.git.*-backup

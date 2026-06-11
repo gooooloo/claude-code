@@ -1,24 +1,10 @@
 import { mock, describe, expect, test } from 'bun:test'
+import { logMock } from '../../../../tests/mocks/log'
 import { createFileStateCacheWithSizeLimit } from '../../../utils/fileStateCache.js'
 import { createSubagentContext } from '../../../utils/forkedAgent.js'
 import { getEmptyToolPermissionContext } from '../../../Tool.js'
 
-mock.module('src/utils/log.ts', () => ({
-  logError: () => {},
-  logToFile: () => {},
-  getLogDisplayTitle: () => '',
-  logEvent: () => {},
-  logMCPError: () => {},
-  logMCPDebug: () => {},
-  dateToFilename: (d: Date) => d.toISOString().replace(/[:.]/g, '-'),
-  getLogFilePath: () => '/tmp/mock-log',
-  attachErrorLogSink: () => {},
-  getInMemoryErrors: () => [],
-  loadErrorLogs: async () => [],
-  getErrorLogByIndex: async () => null,
-  captureAPIRequest: () => {},
-  _resetErrorLogForTesting: () => {},
-}))
+mock.module('src/utils/log.ts', logMock)
 
 const {
   getDenyRuleForTool,
@@ -36,7 +22,10 @@ function makeContext(opts: { denyRules?: string[]; askRules?: string[] }) {
   return { ...ctx, alwaysDenyRules: deny, alwaysAskRules: ask } as any
 }
 
-function makeTool(name: string, mcpInfo?: { serverName: string; toolName: string }) {
+function makeTool(
+  name: string,
+  mcpInfo?: { serverName: string; toolName: string },
+) {
   return { name, mcpInfo }
 }
 
@@ -102,7 +91,9 @@ describe('Langfuse trace propagation', () => {
       messages: [],
       abortController: new AbortController(),
       readFileState: createFileStateCacheWithSizeLimit(1),
-      getAppState: () => ({ toolPermissionContext: getEmptyToolPermissionContext() }),
+      getAppState: () => ({
+        toolPermissionContext: getEmptyToolPermissionContext(),
+      }),
       setAppState: () => {},
       updateFileHistoryState: () => {},
       updateAttributionState: () => {},
@@ -129,7 +120,9 @@ describe('filterDeniedAgents', () => {
     expect(result[0]!.agentType).toBe('Research')
   })
   test('returns empty array when all agents denied', () => {
-    const ctx = makeContext({ denyRules: ['Agent(Explore)', 'Agent(Research)'] })
+    const ctx = makeContext({
+      denyRules: ['Agent(Explore)', 'Agent(Research)'],
+    })
     const agents = [{ agentType: 'Explore' }, { agentType: 'Research' }]
     expect(filterDeniedAgents(agents, ctx, 'Agent')).toEqual([])
   })

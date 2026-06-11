@@ -445,7 +445,7 @@ export function useManageMCPConnections(
 
                   // Schedule next retry with exponential backoff
                   const backoffMs = Math.min(
-                    INITIAL_BACKOFF_MS * Math.pow(2, attempt - 1),
+                    INITIAL_BACKOFF_MS * 2 ** (attempt - 1),
                     MAX_BACKOFF_MS,
                   )
                   logMCPDebug(
@@ -504,7 +504,7 @@ export function useManageMCPConnections(
             case 'register':
               logMCPDebug(client.name, 'Channel notifications registered')
               client.client.setNotificationHandler(
-                ChannelMessageNotificationSchema(),
+                ChannelMessageNotificationSchema() as any,
                 async notification => {
                   const { content, meta } = notification.params
                   logMCPDebug(
@@ -536,12 +536,10 @@ export function useManageMCPConnections(
               // reply and emits {request_id, behavior}; no regex on our
               // side, text in the general channel can't accidentally match.
               if (
-                client.capabilities?.experimental?.[
-                  'claude/channel/permission'
-                ]
+                client.capabilities?.experimental?.['claude/channel/permission']
               ) {
                 client.client.setNotificationHandler(
-                  ChannelPermissionNotificationSchema(),
+                  ChannelPermissionNotificationSchema() as any,
                   async notification => {
                     const { request_id, behavior } = notification.params
                     const resolved =
@@ -567,9 +565,7 @@ export function useManageMCPConnections(
               client.client.removeNotificationHandler(
                 'notifications/claude/channel',
               )
-              client.client.removeNotificationHandler(
-                CHANNEL_PERMISSION_METHOD,
-              )
+              client.client.removeNotificationHandler(CHANNEL_PERMISSION_METHOD)
               logMCPDebug(
                 client.name,
                 `Channel notifications skipped: ${gate.reason}`,
