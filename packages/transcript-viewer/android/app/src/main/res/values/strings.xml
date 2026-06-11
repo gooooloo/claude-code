@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Claude Transcripts</string>
+    <string name="title_activity_main">Claude Transcripts</string>
+    <string name="package_name">best.claudecode.transcripts</string>
+    <string name="custom_url_scheme">best.claudecode.transcripts</string>
+</resources>

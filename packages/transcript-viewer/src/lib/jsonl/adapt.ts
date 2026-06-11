@@ -287,6 +287,102 @@ function matchTag(text: string, tag: string): string | null {
 }
 
 // =============================================================================
+// 未决 AskUserQuestion 提取 — 用于连接模式下渲染原生选项按钮
+// =============================================================================
+
+export interface PendingQuestionOption {
+  label: string
+  description?: string
+}
+
+export interface PendingQuestion {
+  toolUseId: string
+  question: string
+  header?: string
+  multiSelect: boolean
+  options: PendingQuestionOption[]
+}
+
+/** 找到链尾未配对 tool_result 的 AskUserQuestion，提取问题与选项 */
+export function extractPendingQuestions(chain: RawEntry[]): PendingQuestion[] {
+  // 收集所有已有结果的 tool_use_id
+  const resolved = new Set<string>()
+  for (const entry of chain) {
+    if (entry.type !== 'user') continue
+    const content = entry.message?.content
+    if (!Array.isArray(content)) continue
+    for (const block of content) {
+      if (
+        block.type === 'tool_result' &&
+        typeof block.tool_use_id === 'string'
+      ) {
+        resolved.add(block.tool_use_id)
+      }
+    }
+  }
+
+  // 从链尾往前找最近的 assistant 消息里未决的 AskUserQuestion
+  for (let i = chain.length - 1; i >= 0; i--) {
+    const entry = chain[i]
+    if (entry.type !== 'assistant') continue
+    const content = entry.message?.content
+    if (!Array.isArray(content)) continue
+    const pending: PendingQuestion[] = []
+    for (const block of content) {
+      if (
+        block.type === 'tool_use' &&
+        block.name === 'AskUserQuestion' &&
+        typeof block.id === 'string' &&
+        !resolved.has(block.id)
+      ) {
+        pending.push(...parseQuestionInput(block.id, block.input))
+      }
+    }
+    if (pending.length > 0) return pending
+    // 最近的 assistant 没有未决问题就不再往前找（避免捞到历史问题）
+    if (content.some(b => b.type === 'tool_use')) return []
+  }
+  return []
+}
+
+function parseQuestionInput(
+  toolUseId: string,
+  input: Record<string, unknown> | undefined,
+): PendingQuestion[] {
+  const questions = input?.questions
+  if (!Array.isArray(questions)) return []
+  const result: PendingQuestion[] = []
+  for (const q of questions) {
+    if (!q || typeof q !== 'object') continue
+    const record = q as Record<string, unknown>
+    if (typeof record.question !== 'string') continue
+    const options: PendingQuestionOption[] = []
+    if (Array.isArray(record.options)) {
+      for (const opt of record.options) {
+        if (!opt || typeof opt !== 'object') continue
+        const optRecord = opt as Record<string, unknown>
+        if (typeof optRecord.label !== 'string') continue
+        options.push({
+          label: optRecord.label,
+          description:
+            typeof optRecord.description === 'string'
+              ? optRecord.description
+              : undefined,
+        })
+      }
+    }
+    result.push({
+      toolUseId,
+      question: record.question,
+      header: typeof record.header === 'string' ? record.header : undefined,
+      multiSelect: record.multiSelect === true,
+      options,
+    })
+  }
+  return result
+}
+
+// =============================================================================
 // 工具
 // =============================================================================
 

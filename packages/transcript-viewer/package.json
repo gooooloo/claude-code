@@ -11,6 +11,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@capacitor/android": "^8.4.0",
+    "@capacitor/core": "^8.4.0",
     "@radix-ui/react-collapsible": "^1.1.12",
     "@radix-ui/react-use-controllable-state": "^1.2.2",
     "clsx": "^2.1.1",
@@ -22,6 +24,7 @@
     "use-stick-to-bottom": "^1.1.1"
   },
   "devDependencies": {
+    "@capacitor/cli": "^8.4.0",
     "@tailwindcss/vite": "^4.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
