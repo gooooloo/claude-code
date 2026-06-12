@@ -5,7 +5,7 @@ import { clientId } from '../lib/clientId';
 import type { ConnectionConfig } from '../lib/connections';
 import type { PendingQuestion } from '../lib/jsonl/adapt';
 import { type PermissionView, useLiveSession } from '../lib/liveSession';
-import type { InputAction, RemoteSessionInfo } from '../lib/protocol';
+import type { InputAction, PermissionQuestion, RemoteSessionInfo } from '../lib/protocol';
 import { cn, truncate } from '../lib/utils';
 import { ChatView } from './chat/ChatView';
 import { InputBar } from './InputBar';
@@ -267,45 +267,102 @@ function DecideButton({
   );
 }
 
-// AskUserQuestion：逐题选选项，累积答案后一次提交
+// 每问的选择状态：选中的 label 列表 + 自由文本（"其他"）
+interface QState {
+  selected: string[];
+  other: string;
+}
+
+/** 把一问的状态合成答案字符串（多选/自由文本用逗号拼） */
+function composeAnswer(state: QState): string {
+  const parts = [...state.selected];
+  const other = state.other.trim();
+  if (other) parts.push(other);
+  return parts.join(', ');
+}
+
+// AskUserQuestion：支持多问、单选/多选、自由文本"其他"；累积后一次提交
 function QuestionDecision({ permission, onDecide }: { permission: PermissionView; onDecide: DecideFn }) {
   const questions = permission.questions ?? [];
-  const [answers, setAnswers] = useState<Record<string, string>>({});
-  const allAnswered = questions.every(q => answers[q.question]);
+  const [states, setStates] = useState<Record<string, QState>>({});
+
+  const stateFor = (q: string): QState => states[q] ?? { selected: [], other: '' };
+  const isAnswered = (q: string) => composeAnswer(stateFor(q)).length > 0;
+  const allAnswered = questions.length > 0 && questions.every(q => isAnswered(q.question));
+
+  const toggleOption = (question: PermissionQuestion, label: string) => {
+    setStates(prev => {
+      const cur = prev[question.question] ?? { selected: [], other: '' };
+      let selected: string[];
+      if (question.multiSelect) {
+        selected = cur.selected.includes(label) ? cur.selected.filter(l => l !== label) : [...cur.selected, label];
+        return { ...prev, [question.question]: { ...cur, selected } };
+      }
+      // 单选：替换，并清掉自由文本（互斥）
+      selected = cur.selected[0] === label ? [] : [label];
+      return { ...prev, [question.question]: { selected, other: '' } };
+    });
+  };
+
+  const setOther = (question: PermissionQuestion, text: string) => {
+    setStates(prev => {
+      const cur = prev[question.question] ?? { selected: [], other: '' };
+      // 单选时输入自由文本会清掉已选项（互斥）
+      const selected = question.multiSelect ? cur.selected : [];
+      return { ...prev, [question.question]: { selected, other: text } };
+    });
+  };
+
+  const submit = () => {
+    const answers: Record<string, string> = {};
+    for (const q of questions) answers[q.question] = composeAnswer(stateFor(q.question));
+    onDecide(permission.id, 'allow', answers);
+  };
 
   return (
     <div className="mt-2 space-y-3">
-      {questions.map(q => (
-        <div key={q.question}>
-          <p className="mb-1.5 text-sm text-text-primary">
-            {q.header && (
-              <span className="mr-2 rounded bg-brand/10 px-1.5 py-0.5 text-[10px] text-brand">{q.header}</span>
-            )}
-            {q.question}
-          </p>
-          <div className="flex flex-wrap gap-2">
-            {q.options.map(opt => {
-              const selected = answers[q.question] === opt.label;
-              return (
-                <button
-                  key={opt.label}
-                  type="button"
-                  title={opt.description}
-                  className={cn(
-                    'rounded-full border px-4 py-2 font-display text-sm transition-colors',
-                    selected
-                      ? 'border-brand bg-brand text-white'
-                      : 'border-brand/40 bg-brand/5 text-text-primary hover:bg-brand/15',
-                  )}
-                  onClick={() => setAnswers(prev => ({ ...prev, [q.question]: opt.label }))}
-                >
-                  {opt.label}
-                </button>
-              );
-            })}
+      {questions.map(q => {
+        const st = stateFor(q.question);
+        return (
+          <div key={q.question}>
+            <p className="mb-1.5 text-sm text-text-primary">
+              {q.header && (
+                <span className="mr-2 rounded bg-brand/10 px-1.5 py-0.5 text-[10px] text-brand">{q.header}</span>
+              )}
+              {q.question}
+              {q.multiSelect && <span className="ml-2 text-[10px] text-text-muted">可多选</span>}
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {q.options.map(opt => {
+                const selected = st.selected.includes(opt.label);
+                return (
+                  <button
+                    key={opt.label}
+                    type="button"
+                    title={opt.description}
+                    className={cn(
+                      'rounded-full border px-4 py-2 font-display text-sm transition-colors',
+                      selected
+                        ? 'border-brand bg-brand text-white'
+                        : 'border-brand/40 bg-brand/5 text-text-primary hover:bg-brand/15',
+                    )}
+                    onClick={() => toggleOption(q, opt.label)}
+                  >
+                    {q.multiSelect && <span className="mr-1">{selected ? '☑' : '☐'}</span>}
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+            <input
+              className="mt-2 w-full rounded-lg border border-border bg-surface-1 px-3 py-1.5 text-sm text-text-primary placeholder:text-text-muted focus:border-brand/50 focus:outline-none"
+              placeholder="其他（自由输入）…"
+              value={st.other}
+              onChange={e => setOther(q, e.target.value)}
+            />
           </div>
-        </div>
-      ))}
+        );
+      })}
       <button
         type="button"
         disabled={!allAnswered}
@@ -313,7 +370,7 @@ function QuestionDecision({ permission, onDecide }: { permission: PermissionView
           'w-full rounded-lg bg-brand px-4 py-2 font-display text-sm font-medium text-white transition-opacity',
           !allAnswered && 'opacity-40',
         )}
-        onClick={() => onDecide(permission.id, 'allow', answers)}
+        onClick={submit}
       >
         提交回答
       </button>

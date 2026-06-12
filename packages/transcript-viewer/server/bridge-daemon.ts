@@ -40,6 +40,7 @@ interface Args {
   host: string
   token: string
   mock: boolean
+  askAll: boolean
   verbose: boolean
 }
 
@@ -49,6 +50,7 @@ function parseArgs(argv: string[]): Args {
     host: '127.0.0.1',
     token: process.env.RELAY_TOKEN ?? '',
     mock: false,
+    askAll: false,
     verbose: false,
   }
   for (let i = 0; i < argv.length; i++) {
@@ -57,6 +59,8 @@ function parseArgs(argv: string[]): Args {
     else if (a === '--host') args.host = argv[++i]
     else if (a === '--token') args.token = argv[++i]
     else if (a === '--mock') args.mock = true
+    else if (a === '--ask-all')
+      args.askAll = true // 忽略 allow 规则，非只读一律提示
     else if (a === '--verbose') args.verbose = true
   }
   return args
@@ -267,9 +271,9 @@ function startMockSession(
     setState(session, 'busy')
     await sleep(400)
 
-    // prompt 含"问"→ 演示 AskUserQuestion；含"计划"→ 演示 ExitPlanMode
+    // prompt 含"问"→ 演示 AskUserQuestion（"多选"/"两问" 触发变体）；含"计划"→ ExitPlanMode
     if (prompt.includes('问')) {
-      await mockAskQuestion(session, turn)
+      await mockAskQuestion(session, turn, prompt)
       setState(session, 'idle')
       return
     }
@@ -384,22 +388,34 @@ function startMockSession(
   return session
 }
 
-// mock：AskUserQuestion 一轮
-async function mockAskQuestion(session: Session, turn: number): Promise<void> {
+// mock：AskUserQuestion 一轮（prompt 含「多选」→ 多选；含「两问」→ 双问题）
+async function mockAskQuestion(
+  session: Session,
+  turn: number,
+  prompt = '',
+): Promise<void> {
   const toolUseId = `toolu_ask_${turn}`
-  const question = '你想用哪种部署方式?'
-  const input = {
-    questions: [
-      {
-        question,
-        header: '部署',
-        options: [
-          { label: 'Docker', description: '容器化' },
-          { label: '裸机', description: '直接跑在主机上' },
-        ],
-      },
-    ],
+  const questions: PermissionQuestion[] = [
+    {
+      question: '你想用哪种部署方式?',
+      header: '部署',
+      multiSelect: prompt.includes('多选'),
+      options: [
+        { label: 'Docker', description: '容器化' },
+        { label: '裸机', description: '直接跑在主机上' },
+        { label: 'K8s', description: 'Kubernetes 集群' },
+      ],
+    },
+  ]
+  if (prompt.includes('两问')) {
+    questions.push({
+      question: '用什么数据库?',
+      header: '数据库',
+      multiSelect: false,
+      options: [{ label: 'Postgres' }, { label: 'MySQL' }, { label: 'SQLite' }],
+    })
   }
+  const input = { questions }
   emitEntry(session, {
     type: 'assistant',
     message: {
@@ -414,11 +430,7 @@ async function mockAskQuestion(session: Session, turn: number): Promise<void> {
     'AskUserQuestion',
     input,
     toolUseId,
-    {
-      kind: 'question',
-      title: '请回答',
-      questions: input.questions.map(q => ({ ...q, multiSelect: false })),
-    },
+    { kind: 'question', title: '请回答', questions },
   )
   const answers = outcome.answers ?? {}
   emitEntry(session, {
@@ -435,15 +447,15 @@ async function mockAskQuestion(session: Session, turn: number): Promise<void> {
     },
   })
   await sleep(200)
+  const summary = Object.entries(answers)
+    .map(([q, a]) => `${q} → ${a}`)
+    .join('；')
   emitEntry(session, {
     type: 'assistant',
     message: {
       role: 'assistant',
       content: [
-        {
-          type: 'text',
-          text: `好的，按「${answers[question] ?? '(未答)'}」继续。`,
-        },
+        { type: 'text', text: `好的，按「${summary || '(未答)'}」继续。` },
       ],
     },
   })
@@ -556,12 +568,34 @@ async function startRealSession(
   const { FileStateCache } = await import(
     '../../../src/utils/fileStateCache.ts'
   )
+  const { hasPermissionsToUseTool, applyPermissionRulesToPermissionContext } =
+    await import('../../../src/utils/permissions/permissions.ts')
+  const { loadAllPermissionRulesFromDisk } = await import(
+    '../../../src/utils/permissions/permissionsLoader.ts'
+  )
 
-  const permissionContext = getEmptyToolPermissionContext()
+  // 默认尊重用户 settings 的 allow/deny 规则(已允许的不再提示)；--ask-all 则用空规则、
+  // 非只读工具一律提示。内置只读放行在引擎层先生效，根本不到 canUseTool。
+  let permissionContext = getEmptyToolPermissionContext()
+  if (!ARGS.askAll) {
+    // 尊重用户 settings 的 allow/deny 规则(已允许的不再提示)。
+    // 读取以 daemon 启动目录为基准：全局 ~/.claude 规则总是生效；project/local 规则
+    // 取决于 daemon 从哪个目录启动(每机一个 daemon 时通常就是项目根)。--ask-all 跳过。
+    try {
+      permissionContext = applyPermissionRulesToPermissionContext(
+        permissionContext,
+        loadAllPermissionRulesFromDisk(),
+      )
+      if (ARGS.verbose) {
+        const n = Object.values(permissionContext.alwaysAllowRules ?? {}).flat()
+          .length
+        console.log(`[perm] 加载 allow 规则 ${n} 条`)
+      }
+    } catch (err) {
+      if (ARGS.verbose) console.error('[perm] 加载规则失败，回退到全提示', err)
+    }
+  }
   const tools = getTools(permissionContext)
-  // 空 permission context(不加载用户 allow 规则)→ 需权限的工具都走 canUseTool;
-  // 默认模式下内置只读放行仍生效(如只读 Bash)，这是期望行为。
-  // (偏保守:远程控制场景宁可多问，不漏放行。)
   const appState = {
     ...getDefaultAppState(),
     toolPermissionContext: { ...permissionContext, mode: 'default' as const },
@@ -575,15 +609,17 @@ async function startRealSession(
 
   // 结构化权限回调:三类(question / plan / permission)都登记 pending、广播全端、
   // 等第一个客户端，返回值交还引擎。
+  // tool/ctx/asst 是内部模块的结构化类型，daemon 不在 tsconfig，用 any 桥接，运行时已验证
   const canUseTool = async (
     tool: { name: string },
     input: Record<string, unknown>,
-    _ctx: unknown,
-    _asst: unknown,
+    ctx: unknown,
+    asst: unknown,
     toolUseID: string,
   ) => {
     if (ARGS.verbose) console.log(`[perm] canUseTool: ${tool.name}`)
 
+    // AskUserQuestion / ExitPlanMode 本质是交互，不走 allow 规则旁路，直接到客户端。
     // AskUserQuestion：答案经 updatedInput.answers 回传，不是 allow/deny
     if (tool.name === 'AskUserQuestion') {
       const questions = parseQuestions(input)
@@ -625,7 +661,25 @@ async function startRealSession(
       return { behavior: 'allow' as const, updatedInput: input }
     }
 
-    // 普通工具权限：allow / deny
+    // 普通工具：先跑权限 pipeline(尊重用户 allow/deny 规则、模式等)。
+    // allow/deny 直接返回(不提示)；ask 才推到客户端。
+    try {
+      const pipe = await hasPermissionsToUseTool(
+        tool,
+        input,
+        ctx,
+        asst,
+        toolUseID,
+      )
+      if (pipe.behavior === 'allow' || pipe.behavior === 'deny') {
+        if (ARGS.verbose)
+          console.log(`[perm] 规则命中 ${tool.name} -> ${pipe.behavior}`)
+        return pipe
+      }
+    } catch (err) {
+      if (ARGS.verbose) console.error('[perm] pipeline 出错，转为提示', err)
+    }
+
     const outcome = await requestPermission(
       session,
       tool.name,

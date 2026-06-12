@@ -248,12 +248,26 @@ daemon 用**本 repo 内部的 `QueryEngine`** 跑真实会话（不是 publishe
 > 子进程时需权限的工具既不执行也不回调 `canUseTool`（只读工具正常），疑似版本握手问题。
 > 内部 QueryEngine 路径无此问题。
 
+## AskUserQuestion 细节
+
+- **多问题**：一次 AskUserQuestion 可含多问，客户端逐问作答，全部答完才能提交。
+- **多选**（`multiSelect: true`）：选项可多选，答案按逗号拼（如 `Docker, K8s`）——符合工具
+  对 answers 的约定（多选逗号分隔）。
+- **自由文本「其他」**：每问附一个自由输入框（AskUserQuestion 总是允许 Other）。单选时
+  输入自由文本会与选项互斥；多选时自由文本作为附加项一并提交。
+- 答案以 `answers:{问题文本: 选中label}` 经决定端点回传 → daemon 用 `updatedInput.answers`
+  交还引擎 → 工具结果即这些答案。实测：真实会话单问 + mock 多选/双问均跑通。
+
 ## 权限范围
 
-daemon 用空 permission context（不加载用户 `settings.json` 的 allow 规则）+ `default` 模式：
-需权限的工具都走 `canUseTool`（推到客户端），内置只读放行（如只读 Bash）仍自动执行。
-偏保守——远程控制场景宁可多问，不漏放行。如需尊重用户 allow 规则减少提示，可改为从 settings
-构建 permission context。
+daemon **默认尊重用户的 allow/deny 规则**（`loadAllPermissionRulesFromDisk` + 标准权限
+pipeline `hasPermissionsToUseTool`）：已被规则放行的工具不再提示，命中 deny 的直接拒，其余
+（`ask`）才推到客户端。内置只读放行（如只读 Bash）在引擎层先生效，根本不到 canUseTool。
+
+- 规则读取以 **daemon 启动目录**为基准：全局 `~/.claude/settings.json` 规则总是生效；
+  project/local 规则取决于 daemon 从哪个目录启动（每机一个 daemon 时通常即项目根）。
+- `--ask-all`：忽略所有 allow 规则，非只读工具一律提示（最保守，适合"什么都要在手机上过一遍"）。
+- AskUserQuestion / ExitPlanMode 本质是交互，**不走** allow 规则旁路，始终推到客户端。
 
 ## 已知边界
 
