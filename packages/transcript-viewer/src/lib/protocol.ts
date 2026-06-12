@@ -52,15 +52,38 @@ export interface StateEvent {
 // 权限请求（daemon canUseTool）—— 结构化、可被任意客户端回应
 // =============================================================================
 
+// 三种待决形态，都经 canUseTool 进来：
+//  - permission：普通工具权限，allow / deny
+//  - question：AskUserQuestion，答案是「选了哪个选项」，经 updatedInput.answers 回传
+//  - plan：ExitPlanMode，allow=批准计划 / deny=继续规划
+export type PermissionKind = 'permission' | 'question' | 'plan'
+
+export interface PermissionQuestionOption {
+  label: string
+  description?: string
+}
+
+export interface PermissionQuestion {
+  question: string
+  header?: string
+  multiSelect: boolean
+  options: PermissionQuestionOption[]
+}
+
 export interface PermissionRequestInfo {
-  id: string // 本次权限请求的唯一 id（仲裁键）
+  id: string // 本次请求的唯一 id（仲裁键）
+  kind: PermissionKind
   toolName: string
-  title?: string // SDK 渲染的完整提示句（优先用它）
+  title?: string // 完整提示句（优先用它）
   displayName?: string // 简短动作名，适合按钮
   description?: string // 副标题
   input?: Record<string, unknown> // 工具入参（命令、文件路径等）
   toolUseID: string
   createdAt: number // epoch ms
+  // kind === 'question' 时携带
+  questions?: PermissionQuestion[]
+  // kind === 'plan' 时携带
+  plan?: string
 }
 
 // event: permission_request —— 新的待决权限（连接时也会把当前 pending 的补发）
@@ -79,6 +102,8 @@ export interface PermissionResolvedEvent {
 export interface PermissionDecision {
   decision: 'allow' | 'deny'
   clientId: string // 客户端标识，用于回显"由谁处理"
+  // kind === 'question' 时携带：问题文本 -> 选中的 label（多选用逗号拼）
+  answers?: Record<string, string>
 }
 
 export interface PermissionDecisionResponse {

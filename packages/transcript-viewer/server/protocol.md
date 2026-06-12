@@ -227,7 +227,22 @@ daemon 用**本 repo 内部的 `QueryEngine`** 跑真实会话（不是 publishe
 | **`canUseTool` 结构化权限触发** | ✅ **真实会话跑通**（写命令触发回调） |
 | 权限仲裁(先到先得) → 批准 → 工具真执行 → 回合继续 | ✅ 真实会话跑通（文件真创建） |
 | 连续多个工具权限（逐个 canUseTool） | ✅ 真实会话跑通 |
+| **AskUserQuestion**（答案经 updatedInput.answers 回传） | ✅ **真实会话跑通**（答"面条"→Claude 据此回复） |
+| **ExitPlanMode**（allow=批准 / deny=继续规划） | ✅ `--mock` UI 跑通（与 question 同一 canUseTool 路径） |
 | 多端先到先得 + 客户端 UI 置灰同步 | ✅ `--mock` 端到端（双标签页 + curl） |
+
+### 三类待决统一走 canUseTool
+
+| kind | 触发工具 | 客户端卡片 | 回应 | daemon 返回给引擎 |
+|---|---|---|---|---|
+| `permission` | 普通工具 | 允许 / 拒绝 | allow/deny | `{behavior, updatedInput}` |
+| `question` | AskUserQuestion | 选项按钮 + 提交 | `answers:{问题:label}` | `{behavior:'allow', updatedInput:{...,answers}}` |
+| `plan` | ExitPlanMode | 计划文本 + 批准/继续 | allow/deny | allow:`{behavior:'allow'}`+切default模式 / deny:`{behavior:'deny'}` |
+
+`permission_request` 事件的 `kind` 字段区分三类；`question` 携带 `questions`，`plan` 携带 `plan`。
+决定端点 `POST .../permission/{id}` 的 body 对 `question` 额外带 `answers`。
+客户端去重：daemon 路径下 AskUserQuestion 同时是 JSONL 里的 tool_use，按 `toolUseID` 去掉
+重复的 JSONL 问题卡，只保留权限通道的那张。
 
 > published SDK（`@anthropic-ai/claude-agent-sdk@0.2.114`）路径已弃用：实测它 spawn `claude`
 > 子进程时需权限的工具既不执行也不回调 `canUseTool`（只读工具正常），疑似版本握手问题。

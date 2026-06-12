@@ -90,6 +90,7 @@ export async function decidePermission(
   permissionId: string,
   decision: 'allow' | 'deny',
   clientId: string,
+  answers?: Record<string, string>,
 ): Promise<PermissionDecisionResponse> {
   const res = await fetch(
     buildUrl(
@@ -99,7 +100,7 @@ export async function decidePermission(
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ decision, clientId }),
+      body: JSON.stringify({ decision, clientId, answers }),
       signal: AbortSignal.timeout(15000),
     },
   )

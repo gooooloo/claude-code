@@ -1,25 +1,31 @@
 #!/usr/bin/env bun
 /**
- * Bridge Daemon —— 路线 1 的服务端:用 Agent SDK 跑 Claude Code 会话,
- * 通过 canUseTool 把权限做成「结构化回调」,由 daemon 持有、广播全端、
- * 第一个客户端的决定原子胜出(解决"本地+多端"并发抢答问题)。
+ * Bridge Daemon —— 路线 1 的服务端:用内部 QueryEngine 跑 Claude Code 会话,
+ * 通过 canUseTool 把「权限 / AskUserQuestion / ExitPlanMode」都做成结构化回调,
+ * 由 daemon 持有、广播全端、第一个客户端的决定原子胜出(解决"本地+多端"并发)。
+ *
+ *  - 普通权限：allow / deny
+ *  - AskUserQuestion(kind=question)：答案经 updatedInput.answers 回传
+ *  - ExitPlanMode(kind=plan)：allow=批准计划 / deny=继续规划
  *
  * 对比 transcript_relay.py(tail JSONL + 按键注入):daemon 直接拥有会话,
- * 权限是回调返回值而非按键,天然对称、可被任意端回应、先到先得。
+ * 回应是回调返回值而非按键,天然对称、可被任意端回应、先到先得。
  *
- * 部署(每台远端机器一份,各自经 devtunnel 暴露):
- *     bun run server/bridge-daemon.ts --token <密钥> --port 19860
+ * !! 必须经 run-daemon.ts 启动(注入 MACRO defines + feature flags),
+ *    直接 `bun run bridge-daemon.ts` 会因 QueryEngine 依赖而 `MACRO is not defined`。
+ *
+ * 部署(每台远端机器一份，在 repo 根目录、各自经 devtunnel 暴露):
+ *     bun run packages/transcript-viewer/server/run-daemon.ts --token <密钥> --port 19860
  *     devtunnel host -p 19860 --allow-anonymous
+ * 本机验证(不跑真会话 / 不耗 API):加 --mock
  *
- * 本机验证(不调真 SDK / 不耗 API):
- *     bun run server/bridge-daemon.ts --token test --port 19860 --mock
- *
- * 协议见 server/protocol.md。会话消息以 JSONL 行形式经 SSE 下发,
- * 客户端复用既有的链重建/渲染;权限走独立的 permission_request/resolved 事件。
+ * 协议见 server/protocol.md。会话消息以 JSONL 行经 SSE 下发(客户端复用既有渲染);
+ * 权限/问题/计划走 permission_request / permission_resolved 事件。
  */
 
 import type {
   PermissionDecision,
+  PermissionQuestion,
   PermissionRequestInfo,
   RemoteSessionInfo,
   RemoteSessionState,
@@ -62,9 +68,14 @@ const ARGS = parseArgs(Bun.argv.slice(2))
 // 会话模型
 // =============================================================================
 
+interface PermissionOutcome {
+  decision: 'allow' | 'deny'
+  answers?: Record<string, string> // kind==='question' 时携带
+}
+
 interface PendingPermission {
   info: PermissionRequestInfo
-  resolve: (decision: 'allow' | 'deny') => void
+  resolve: (outcome: PermissionOutcome) => void
   resolvedBy?: string // 抢答胜者，置位即锁定
 }
 
@@ -140,32 +151,48 @@ function emitEntry(session: Session, entry: Record<string, unknown>): void {
 // 权限仲裁 —— canUseTool 调它，落 pending + 广播；decide 原子胜出
 // =============================================================================
 
+type RequestMeta = Partial<
+  Pick<
+    PermissionRequestInfo,
+    'kind' | 'title' | 'displayName' | 'description' | 'questions' | 'plan'
+  >
+>
+
 function requestPermission(
   session: Session,
   toolName: string,
   input: Record<string, unknown>,
-  meta: {
-    toolUseID: string
-    title?: string
-    displayName?: string
-    description?: string
-  },
-): Promise<'allow' | 'deny'> {
+  toolUseID: string,
+  meta: RequestMeta = {},
+): Promise<PermissionOutcome> {
+  const kind = meta.kind ?? 'permission'
   const info: PermissionRequestInfo = {
     id: crypto.randomUUID(),
+    kind,
     toolName,
     title: meta.title,
     displayName: meta.displayName,
     description: meta.description,
     input,
-    toolUseID: meta.toolUseID,
+    toolUseID,
     createdAt: Date.now(),
+    questions: meta.questions,
+    plan: meta.plan,
   }
-  return new Promise<'allow' | 'deny'>(resolve => {
+  return new Promise<PermissionOutcome>(resolve => {
     session.pending.set(info.id, { info, resolve })
-    setState(session, 'permission')
+    // question/plan 用更贴切的待办状态
+    setState(
+      session,
+      kind === 'question'
+        ? 'elicitation'
+        : kind === 'plan'
+          ? 'plan_review'
+          : 'permission',
+    )
     broadcast(session, 'permission_request', { permission: info })
-    if (ARGS.verbose) console.log(`[perm] 待决 ${toolName} id=${info.id}`)
+    if (ARGS.verbose)
+      console.log(`[perm] 待决 ${kind} ${toolName} id=${info.id}`)
   })
 }
 
@@ -175,6 +202,7 @@ function decidePermission(
   permissionId: string,
   decision: 'allow' | 'deny',
   by: string,
+  answers?: Record<string, string>,
 ): { ok: boolean; alreadyResolvedBy?: string } {
   const pending = session.pending.get(permissionId)
   if (!pending) {
@@ -187,7 +215,7 @@ function decidePermission(
   }
   // 原子置位:JS 单线程，这里的 check-then-set 不会被打断
   pending.resolvedBy = by
-  pending.resolve(decision)
+  pending.resolve({ decision, answers })
   session.pending.delete(permissionId)
   session.recentlyResolved.set(permissionId, by)
   setTimeout(() => session.recentlyResolved.delete(permissionId), 30000)
@@ -198,8 +226,8 @@ function decidePermission(
   })
   if (ARGS.verbose)
     console.log(`[perm] ${permissionId} -> ${decision} by ${by}`)
-  // 还有别的待决就保持 permission，否则回 busy(SDK 会继续)
-  setState(session, session.pending.size > 0 ? 'permission' : 'busy')
+  // 还有别的待决就保持等待态，否则回 busy(引擎会继续)
+  setState(session, session.pending.size > 0 ? session.state : 'busy')
   return { ok: true }
 }
 
@@ -238,6 +266,18 @@ function startMockSession(
     })
     setState(session, 'busy')
     await sleep(400)
+
+    // prompt 含"问"→ 演示 AskUserQuestion；含"计划"→ 演示 ExitPlanMode
+    if (prompt.includes('问')) {
+      await mockAskQuestion(session, turn)
+      setState(session, 'idle')
+      return
+    }
+    if (prompt.includes('计划')) {
+      await mockPlan(session, turn)
+      setState(session, 'idle')
+      return
+    }
     emitEntry(session, {
       type: 'assistant',
       message: {
@@ -269,19 +309,19 @@ function startMockSession(
       },
     })
 
-    const decision = await requestPermission(
+    const outcome = await requestPermission(
       session,
       'Bash',
       { command: `echo "turn ${turn}: ${prompt}"`, description: '演示命令' },
+      toolUseId,
       {
-        toolUseID: toolUseId,
         title: `允许运行命令: echo "turn ${turn}…"?`,
         displayName: '运行命令',
         description: 'Claude 想在终端执行一条 Bash 命令',
       },
     )
 
-    if (decision === 'allow') {
+    if (outcome.decision === 'allow') {
       emitEntry(session, {
         type: 'user',
         message: {
@@ -344,6 +384,135 @@ function startMockSession(
   return session
 }
 
+// mock：AskUserQuestion 一轮
+async function mockAskQuestion(session: Session, turn: number): Promise<void> {
+  const toolUseId = `toolu_ask_${turn}`
+  const question = '你想用哪种部署方式?'
+  const input = {
+    questions: [
+      {
+        question,
+        header: '部署',
+        options: [
+          { label: 'Docker', description: '容器化' },
+          { label: '裸机', description: '直接跑在主机上' },
+        ],
+      },
+    ],
+  }
+  emitEntry(session, {
+    type: 'assistant',
+    message: {
+      role: 'assistant',
+      content: [
+        { type: 'tool_use', id: toolUseId, name: 'AskUserQuestion', input },
+      ],
+    },
+  })
+  const outcome = await requestPermission(
+    session,
+    'AskUserQuestion',
+    input,
+    toolUseId,
+    {
+      kind: 'question',
+      title: '请回答',
+      questions: input.questions.map(q => ({ ...q, multiSelect: false })),
+    },
+  )
+  const answers = outcome.answers ?? {}
+  emitEntry(session, {
+    type: 'user',
+    message: {
+      role: 'user',
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: toolUseId,
+          content: `User has answered your questions: ${JSON.stringify(answers)}`,
+        },
+      ],
+    },
+  })
+  await sleep(200)
+  emitEntry(session, {
+    type: 'assistant',
+    message: {
+      role: 'assistant',
+      content: [
+        {
+          type: 'text',
+          text: `好的，按「${answers[question] ?? '(未答)'}」继续。`,
+        },
+      ],
+    },
+  })
+}
+
+// mock：ExitPlanMode 一轮
+async function mockPlan(session: Session, turn: number): Promise<void> {
+  const toolUseId = `toolu_plan_${turn}`
+  const plan = '1. 建表\n2. 写接口\n3. 加测试'
+  emitEntry(session, {
+    type: 'assistant',
+    message: {
+      role: 'assistant',
+      content: [
+        {
+          type: 'tool_use',
+          id: toolUseId,
+          name: 'ExitPlanMode',
+          input: { plan },
+        },
+      ],
+    },
+  })
+  const outcome = await requestPermission(
+    session,
+    'ExitPlanMode',
+    { plan },
+    toolUseId,
+    {
+      kind: 'plan',
+      title: '批准这个计划?',
+      plan,
+    },
+  )
+  emitEntry(session, {
+    type: 'user',
+    message: {
+      role: 'user',
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: toolUseId,
+          content:
+            outcome.decision === 'allow'
+              ? '计划已批准，开始执行'
+              : '用户希望继续完善计划',
+          is_error: outcome.decision !== 'allow',
+        },
+      ],
+    },
+  })
+  await sleep(200)
+  emitEntry(session, {
+    type: 'assistant',
+    message: {
+      role: 'assistant',
+      content: [
+        {
+          type: 'text',
+          text:
+            outcome.decision === 'allow'
+              ? '计划已批准，开始执行 ✅'
+              : '好的，我继续完善计划。',
+        },
+      ],
+    },
+  })
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms))
 }
@@ -398,7 +567,14 @@ async function startRealSession(
     toolPermissionContext: { ...permissionContext, mode: 'default' as const },
   }
 
-  // 结构化权限回调:登记 pending + 广播全端 + 等第一个客户端，返回值交还引擎
+  const denyResult = (message: string) => ({
+    behavior: 'deny' as const,
+    message,
+    decisionReason: { type: 'mode' as const, mode: 'default' as const },
+  })
+
+  // 结构化权限回调:三类(question / plan / permission)都登记 pending、广播全端、
+  // 等第一个客户端，返回值交还引擎。
   const canUseTool = async (
     tool: { name: string },
     input: Record<string, unknown>,
@@ -407,18 +583,62 @@ async function startRealSession(
     toolUseID: string,
   ) => {
     if (ARGS.verbose) console.log(`[perm] canUseTool: ${tool.name}`)
-    const decision = await requestPermission(session, tool.name, input, {
+
+    // AskUserQuestion：答案经 updatedInput.answers 回传，不是 allow/deny
+    if (tool.name === 'AskUserQuestion') {
+      const questions = parseQuestions(input)
+      const outcome = await requestPermission(
+        session,
+        tool.name,
+        input,
+        toolUseID,
+        {
+          kind: 'question',
+          title: '请回答',
+          questions,
+        },
+      )
+      if (outcome.decision !== 'allow') return denyResult('用户取消了回答')
+      return {
+        behavior: 'allow' as const,
+        updatedInput: { ...input, answers: outcome.answers ?? {} },
+      }
+    }
+
+    // ExitPlanMode：allow=批准计划(切到 default 模式继续执行) / deny=继续规划
+    if (tool.name === 'ExitPlanMode') {
+      const plan = typeof input.plan === 'string' ? input.plan : ''
+      const outcome = await requestPermission(
+        session,
+        tool.name,
+        input,
+        toolUseID,
+        {
+          kind: 'plan',
+          title: '批准这个计划?',
+          plan,
+        },
+      )
+      if (outcome.decision !== 'allow')
+        return denyResult('用户希望继续完善计划')
+      appState.toolPermissionContext.mode = 'default'
+      return { behavior: 'allow' as const, updatedInput: input }
+    }
+
+    // 普通工具权限：allow / deny
+    const outcome = await requestPermission(
+      session,
+      tool.name,
+      input,
       toolUseID,
-      title: permissionTitle(tool.name, input),
-      description: 'Claude 想使用工具',
-    })
-    return decision === 'allow'
+      {
+        title: permissionTitle(tool.name, input),
+        description: 'Claude 想使用工具',
+      },
+    )
+    return outcome.decision === 'allow'
       ? { behavior: 'allow' as const, updatedInput: input }
-      : {
-          behavior: 'deny' as const,
-          message: '用户在客户端拒绝',
-          decisionReason: { type: 'mode' as const, mode: 'default' as const },
-        }
+      : denyResult('用户在客户端拒绝')
   }
 
   // 跨内部模块的结构化类型用 as any 桥接(daemon 不在 tsconfig，运行时已验证)
@@ -484,6 +704,40 @@ function permissionTitle(
     }
   }
   return `允许使用 ${toolName}?`
+}
+
+// 从 AskUserQuestion 的 input.questions 解析出结构化问题（带选项）
+function parseQuestions(input: Record<string, unknown>): PermissionQuestion[] {
+  const raw = input.questions
+  if (!Array.isArray(raw)) return []
+  const result: PermissionQuestion[] = []
+  for (const q of raw) {
+    if (!q || typeof q !== 'object') continue
+    const rec = q as Record<string, unknown>
+    if (typeof rec.question !== 'string') continue
+    const options: PermissionQuestion['options'] = []
+    if (Array.isArray(rec.options)) {
+      for (const opt of rec.options) {
+        if (opt && typeof opt === 'object') {
+          const o = opt as Record<string, unknown>
+          if (typeof o.label === 'string') {
+            options.push({
+              label: o.label,
+              description:
+                typeof o.description === 'string' ? o.description : undefined,
+            })
+          }
+        }
+      }
+    }
+    result.push({
+      question: rec.question,
+      header: typeof rec.header === 'string' ? rec.header : undefined,
+      multiSelect: rec.multiSelect === true,
+      options,
+    })
+  }
+  return result
 }
 
 // SDK 的 SDKMessage → 客户端能解析的 JSONL 行(type:user/assistant + message.content)
@@ -632,6 +886,7 @@ async function handle(req: Request): Promise<Response> {
       permissionId,
       body.decision,
       body.clientId || '未知端',
+      body.answers,
     )
     return json(result)
   }

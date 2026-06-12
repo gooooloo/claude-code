@@ -1,4 +1,4 @@
-import { CheckIcon, ShieldAlertIcon, XIcon } from 'lucide-react';
+import { CheckIcon, ClipboardListIcon, MessageCircleQuestionIcon, ShieldAlertIcon, XIcon } from 'lucide-react';
 import { useCallback, useMemo, useState } from 'react';
 import { decidePermission, sendInput } from '../lib/api';
 import { clientId } from '../lib/clientId';
@@ -33,6 +33,12 @@ export function LiveSessionView({ conn, session }: LiveSessionViewProps) {
   );
   const hiddenCount = total - visible.length;
 
+  // daemon 路径下 AskUserQuestion 由 kind='question' 权限卡片处理；
+  // 去掉 JSONL extractPendingQuestions 里同一 toolUseID 的，避免双卡。
+  const questionToolUseIds = new Set(live.permissions.filter(p => p.kind === 'question').map(p => p.toolUseID));
+  const jsonlQuestions = live.pendingQuestions.filter(q => !questionToolUseIds.has(q.toolUseId));
+  const awaitingAnswer = jsonlQuestions.length > 0;
+
   const dispatch = useCallback(
     async (action: InputAction) => {
       setSendError(null);
@@ -45,7 +51,7 @@ export function LiveSessionView({ conn, session }: LiveSessionViewProps) {
   );
 
   const decide = useCallback(
-    async (permissionId: string, decision: 'allow' | 'deny') => {
+    async (permissionId: string, decision: 'allow' | 'deny', answers?: Record<string, string>) => {
       setSendError(null);
       const result = await decidePermission(
         conn,
@@ -54,6 +60,7 @@ export function LiveSessionView({ conn, session }: LiveSessionViewProps) {
         permissionId,
         decision,
         clientId(),
+        answers,
       );
       // 抢答失败不是错误：说明别的端先答了，UI 会随 resolved 事件置灰
       if (!result.ok && result.error) {
@@ -94,19 +101,19 @@ export function LiveSessionView({ conn, session }: LiveSessionViewProps) {
 
       <ChatView entries={visible} header={header} />
 
-      {/* 权限请求卡片（daemon canUseTool）—— 任意端可答，先到先得 */}
+      {/* 权限/问题/计划卡片（daemon canUseTool）—— 任意端可答，先到先得 */}
       {live.permissions.length > 0 && (
-        <div className="border-t border-border bg-surface-1/60 px-4 py-3 backdrop-blur sm:px-8">
+        <div className="space-y-3 border-t border-border bg-surface-1/60 px-4 py-3 backdrop-blur sm:px-8">
           {live.permissions.map(permission => (
             <PermissionCard key={permission.id} permission={permission} onDecide={decide} />
           ))}
         </div>
       )}
 
-      {/* AskUserQuestion 卡片 */}
-      {live.pendingQuestions.length > 0 && (
+      {/* AskUserQuestion 卡片（relay 路径；daemon 路径下被 kind='question' 权限覆盖，去重） */}
+      {jsonlQuestions.length > 0 && (
         <div className="border-t border-border bg-surface-1/60 px-4 py-3 backdrop-blur sm:px-8">
-          {live.pendingQuestions.map((question, i) => (
+          {jsonlQuestions.map((question, i) => (
             <QuestionCard key={`${question.toolUseId}-${i}`} question={question} onAction={dispatch} />
           ))}
         </div>
@@ -120,10 +127,8 @@ export function LiveSessionView({ conn, session }: LiveSessionViewProps) {
 
       <InputBar
         busy={live.sessionState === 'busy'}
-        placeholder={live.pendingQuestions.length > 0 ? '或直接输入自由回答…' : '发送消息到这个会话…'}
-        onSend={text =>
-          dispatch(live.pendingQuestions.length > 0 ? { type: 'text_answer', text } : { type: 'prompt', text })
-        }
+        placeholder={awaitingAnswer ? '或直接输入自由回答…' : '发送消息到这个会话…'}
+        onSend={text => dispatch(awaitingAnswer ? { type: 'text_answer', text } : { type: 'prompt', text })}
         onInterrupt={() => dispatch({ type: 'interrupt' })}
       />
     </div>
@@ -131,19 +136,14 @@ export function LiveSessionView({ conn, session }: LiveSessionViewProps) {
 }
 
 // =============================================================================
-// 权限请求卡片 —— 已解决则置灰显示"已由 X 处理"
+// 权限/问题/计划卡片 —— 按 kind 渲染；已解决则置灰显示"已由 X 处理"
 // =============================================================================
 
-function PermissionCard({
-  permission,
-  onDecide,
-}: {
-  permission: PermissionView;
-  onDecide: (permissionId: string, decision: 'allow' | 'deny') => void;
-}) {
+type DecideFn = (permissionId: string, decision: 'allow' | 'deny', answers?: Record<string, string>) => void;
+
+function PermissionCard({ permission, onDecide }: { permission: PermissionView; onDecide: DecideFn }) {
   const resolved = permission.resolved;
-  const title = permission.title ?? `允许使用 ${permission.toolName}?`;
-  const detail = permissionDetail(permission);
+  const iconColor = resolved ? 'text-text-muted' : 'text-brand';
 
   return (
     <div
@@ -153,39 +153,170 @@ function PermissionCard({
       )}
     >
       <div className="flex items-start gap-2">
-        <ShieldAlertIcon className={cn('mt-0.5 size-4 flex-shrink-0', resolved ? 'text-text-muted' : 'text-brand')} />
+        {permission.kind === 'plan' ? (
+          <ClipboardListIcon className={cn('mt-0.5 size-4 flex-shrink-0', iconColor)} />
+        ) : permission.kind === 'question' ? (
+          <MessageCircleQuestionIcon className={cn('mt-0.5 size-4 flex-shrink-0', iconColor)} />
+        ) : (
+          <ShieldAlertIcon className={cn('mt-0.5 size-4 flex-shrink-0', iconColor)} />
+        )}
         <div className="min-w-0 flex-1">
-          <p className="font-display text-sm font-medium text-text-primary">{title}</p>
-          {detail && <p className="mt-0.5 break-all font-mono text-xs text-text-secondary">{truncate(detail, 300)}</p>}
-          {permission.description && <p className="mt-0.5 text-xs text-text-muted">{permission.description}</p>}
+          <p className="font-display text-sm font-medium text-text-primary">{cardTitle(permission)}</p>
+          <PermissionBody permission={permission} />
         </div>
       </div>
 
       {resolved ? (
         <p className="mt-2 text-xs text-text-muted">
           已由 <span className="font-medium text-text-secondary">{resolved.by}</span>{' '}
-          {resolved.behavior === 'allow' ? '允许' : '拒绝'}
+          {resolvedVerb(permission.kind, resolved.behavior)}
         </p>
+      ) : permission.kind === 'question' ? (
+        <QuestionDecision permission={permission} onDecide={onDecide} />
+      ) : permission.kind === 'plan' ? (
+        <div className="mt-2.5 flex gap-2">
+          <DecideButton
+            tone="brand"
+            icon={<CheckIcon className="size-4" />}
+            label="批准计划"
+            onClick={() => onDecide(permission.id, 'allow')}
+          />
+          <DecideButton
+            tone="ghost"
+            icon={<XIcon className="size-4" />}
+            label="继续规划"
+            onClick={() => onDecide(permission.id, 'deny')}
+          />
+        </div>
       ) : (
         <div className="mt-2.5 flex gap-2">
-          <button
-            type="button"
-            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-brand px-4 py-2 font-display text-sm font-medium text-white transition-opacity active:opacity-80"
+          <DecideButton
+            tone="brand"
+            icon={<CheckIcon className="size-4" />}
+            label="允许"
             onClick={() => onDecide(permission.id, 'allow')}
-          >
-            <CheckIcon className="size-4" />
-            允许
-          </button>
-          <button
-            type="button"
-            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-border px-4 py-2 font-display text-sm font-medium text-text-secondary transition-colors hover:border-status-error/40 hover:text-status-error"
+          />
+          <DecideButton
+            tone="ghost"
+            icon={<XIcon className="size-4" />}
+            label="拒绝"
             onClick={() => onDecide(permission.id, 'deny')}
-          >
-            <XIcon className="size-4" />
-            拒绝
-          </button>
+          />
         </div>
       )}
+    </div>
+  );
+}
+
+function cardTitle(p: PermissionView): string {
+  if (p.title) return p.title;
+  if (p.kind === 'plan') return '批准这个计划?';
+  if (p.kind === 'question') return '请回答';
+  return `允许使用 ${p.toolName}?`;
+}
+
+function resolvedVerb(kind: PermissionView['kind'], behavior: 'allow' | 'deny'): string {
+  if (kind === 'question') return '回答';
+  if (kind === 'plan') return behavior === 'allow' ? '批准' : '退回';
+  return behavior === 'allow' ? '允许' : '拒绝';
+}
+
+function PermissionBody({ permission }: { permission: PermissionView }) {
+  if (permission.kind === 'plan' && permission.plan) {
+    return (
+      <pre className="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap rounded-md bg-surface-1 p-2 font-mono text-xs text-text-secondary">
+        {permission.plan}
+      </pre>
+    );
+  }
+  if (permission.kind === 'question') return null;
+  const detail = permissionDetail(permission);
+  return (
+    <>
+      {detail && <p className="mt-0.5 break-all font-mono text-xs text-text-secondary">{truncate(detail, 300)}</p>}
+      {permission.description && <p className="mt-0.5 text-xs text-text-muted">{permission.description}</p>}
+    </>
+  );
+}
+
+function DecideButton({
+  tone,
+  icon,
+  label,
+  onClick,
+}: {
+  tone: 'brand' | 'ghost';
+  icon: React.ReactNode;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={cn(
+        'flex flex-1 items-center justify-center gap-1.5 rounded-lg px-4 py-2 font-display text-sm font-medium transition-colors',
+        tone === 'brand'
+          ? 'bg-brand text-white active:opacity-80'
+          : 'border border-border text-text-secondary hover:border-status-error/40 hover:text-status-error',
+      )}
+      onClick={onClick}
+    >
+      {icon}
+      {label}
+    </button>
+  );
+}
+
+// AskUserQuestion：逐题选选项，累积答案后一次提交
+function QuestionDecision({ permission, onDecide }: { permission: PermissionView; onDecide: DecideFn }) {
+  const questions = permission.questions ?? [];
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const allAnswered = questions.every(q => answers[q.question]);
+
+  return (
+    <div className="mt-2 space-y-3">
+      {questions.map(q => (
+        <div key={q.question}>
+          <p className="mb-1.5 text-sm text-text-primary">
+            {q.header && (
+              <span className="mr-2 rounded bg-brand/10 px-1.5 py-0.5 text-[10px] text-brand">{q.header}</span>
+            )}
+            {q.question}
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {q.options.map(opt => {
+              const selected = answers[q.question] === opt.label;
+              return (
+                <button
+                  key={opt.label}
+                  type="button"
+                  title={opt.description}
+                  className={cn(
+                    'rounded-full border px-4 py-2 font-display text-sm transition-colors',
+                    selected
+                      ? 'border-brand bg-brand text-white'
+                      : 'border-brand/40 bg-brand/5 text-text-primary hover:bg-brand/15',
+                  )}
+                  onClick={() => setAnswers(prev => ({ ...prev, [q.question]: opt.label }))}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+      <button
+        type="button"
+        disabled={!allAnswered}
+        className={cn(
+          'w-full rounded-lg bg-brand px-4 py-2 font-display text-sm font-medium text-white transition-opacity',
+          !allAnswered && 'opacity-40',
+        )}
+        onClick={() => onDecide(permission.id, 'allow', answers)}
+      >
+        提交回答
+      </button>
     </div>
   );
 }
