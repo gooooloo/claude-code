@@ -209,9 +209,28 @@ data: { "id", "behavior": "allow"|"deny", "by": "<胜者客户端标识>" }
 「裸 TUI 的原生权限框」无法成为并发响应者——这是 TUI 的硬限制，不是本设计的取舍。
 daemon 把权限移出 TUI、变成结构化回调，才换来真正对等的多端作答。
 
+## 真 SDK 验证状态（在 Mac 上实测）
+
+| 能力 | 状态 |
+|---|---|
+| 跨平台（Mac/Linux/Windows，daemon 无平台专用代码） | ✅ 在 Mac 上实测 |
+| 流式输入（客户端 prompt → SDK 多轮） | ✅ 真 SDK 跑通 |
+| SDK 消息 → JSONL 行 → 客户端渲染 | ✅ 真 SDK 跑通 |
+| 只读工具自动执行（如 `cat`，built-in readonly 放行） | ✅ 真 SDK 跑通 |
+| 权限仲裁 + 多端先到先得 + 客户端 UI | ✅ `--mock` 端到端跑通（双标签页 + curl） |
+| **`canUseTool` 结构化权限（真 SDK）** | ❌ **未触发**——见下 |
+
+**关键发现**：published SDK（`@anthropic-ai/claude-agent-sdk@0.2.114`）在本机 spawn `claude`
+子进程时，**需要权限的工具（如写文件）既不执行也不回调 `canUseTool`**（只读工具正常）。
+疑似 SDK 与本机 `claude` 二进制的权限控制协议版本不匹配。
+
+**可靠的修法**：本 repo 自己的 ACP 实现（`src/services/acp/agent.ts`）用的是**内部 `QueryEngine`**
+（`QueryEngineConfig.canUseTool` + `appState.toolPermissionContext.mode`），不是 published SDK 的
+子进程路径——它的 `canUseTool` 是验证可用的。daemon 要拿到真实权限回调，应改接内部 QueryEngine
+（像 ACP 那样），或在你的部署机上核对 SDK 与 claude 版本握手。**仲裁/广播/UI 那套已与权限来源解耦，
+换成 QueryEngine 后直接复用。**
+
 ## 已知边界
 
 - daemon 跑的会话不是你直接敲的裸 TUI；RDP 进机器时，在该机 localhost 开个客户端作答（与手机对称）。
-- `bridge-daemon.ts` 的真 SDK 路径（`startRealSession`）需在已登录 Claude Code 的机器上验证；
-  本仓库的端到端测试用 `--mock` 覆盖了协议 + 客户端 + 多端先到先得仲裁的完整闭环。
-- AskUserQuestion / ExitPlanMode 也可经同一 `canUseTool` 通道结构化呈现（当前 mock 演示了 Bash 权限）。
+- AskUserQuestion / ExitPlanMode 也可经同一权限通道结构化呈现（mock 演示了 Bash 权限）。

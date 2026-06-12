@@ -34,6 +34,7 @@ interface Args {
   host: string
   token: string
   mock: boolean
+  askAll: boolean
   verbose: boolean
 }
 
@@ -43,6 +44,7 @@ function parseArgs(argv: string[]): Args {
     host: '127.0.0.1',
     token: process.env.RELAY_TOKEN ?? '',
     mock: false,
+    askAll: false,
     verbose: false,
   }
   for (let i = 0; i < argv.length; i++) {
@@ -51,6 +53,7 @@ function parseArgs(argv: string[]): Args {
     else if (a === '--host') args.host = argv[++i]
     else if (a === '--token') args.token = argv[++i]
     else if (a === '--mock') args.mock = true
+    else if (a === '--ask-all') args.askAll = true
     else if (a === '--verbose') args.verbose = true
   }
   return args
@@ -389,7 +392,6 @@ async function startRealSession(
           type: 'user' as const,
           message: { role: 'user' as const, content: text },
           parent_tool_use_id: null,
-          session_id: sessionId,
         }
       }
       await new Promise<void>(r => {
@@ -406,8 +408,18 @@ async function startRealSession(
     prompt: promptStream(),
     options: {
       cwd,
-      // 结构化权限回调:不在本地决定，登记 pending + 广播 + 等第一个客户端
+      // 默认权限模式:已被 allow 规则覆盖的自动通过，其余走 canUseTool。
+      // --ask-all(开发/演示):额外不加载 settings 的 allow 规则，让每个工具都提示。
+      permissionMode: 'default',
+      ...(ARGS.askAll ? { settingSources: [] as never } : {}),
+      // 结构化权限回调。
+      // ⚠️ 实测发现:published SDK(@anthropic-ai/claude-agent-sdk 0.2.114)在本机
+      //   spawn claude 子进程时，需要权限的工具(如写文件)既不执行也不回调这里,
+      //   疑似 SDK 与 claude 二进制的权限控制协议版本不匹配。只读工具(cat 等)正常
+      //   执行并返回。→ 真正可靠的 canUseTool 通道是本 repo 内部的 QueryEngine
+      //   (src/services/acp/agent.ts 即用它 + toolPermissionContext)。详见 protocol.md。
       canUseTool: async (toolName, input, ctx) => {
+        if (ARGS.verbose) console.log(`[perm] canUseTool 被调用: ${toolName}`)
         const decision = await requestPermission(session, toolName, input, {
           toolUseID: ctx.toolUseID,
           title: ctx.title,
