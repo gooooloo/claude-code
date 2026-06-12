@@ -146,9 +146,13 @@ devtunnel host -p 19860 --allow-anonymous
 (snapshot/append/state)、`POST /input`，会话消息同样以 JSONL 行下发，客户端的链重建/渲染不变。
 差异只在多了**权限通道**。
 
+> **daemon 没有终端窗口，不接管已有会话。** `GET /api/sessions` 只返回 daemon **自己创建**的会话；
+> 会话必须由客户端 `POST /api/sessions` 新建。你在终端里另开的 `claude` 对 daemon 不可见——
+> 那是 relay（tail 终端 JSONL）的职责。想接管终端会话用 relay；想从客户端全程起新会话用 daemon。
+
 ## 设计原则
 
-1. **daemon 拥有会话** —— 用 Agent SDK `query()` 跑 Claude Code，不是 tail 外部进程。
+1. **daemon 拥有会话** —— 用内部 QueryEngine 跑 Claude Code，自己创建并持有，不是 tail 外部进程。
 2. **权限是回调返回值，不是按键** —— `canUseTool` 触发时，daemon 不在本地决定，而是登记一个待决请求、
    广播给所有连接的客户端、`await` 第一个决定，再把它作为回调返回值交还 SDK。**因为是单一返回值，
    不可能"双重生效"或漏进下一个框**（这正是按键注入做不到的）。

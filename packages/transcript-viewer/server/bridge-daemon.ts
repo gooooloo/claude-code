@@ -718,6 +718,13 @@ async function startRealSession(
     running = true
     while (turnQueue.length > 0) {
       const prompt = turnQueue.shift() as string
+      // 先把用户输入下发为 user 行(QueryEngine 默认不 replay 人类 prompt，
+      // submitMessage 的流里只有 assistant + tool_result(也是 user 类型)，
+      // 不含人类这条；不手动发客户端就看不到自己说了什么)。
+      emitEntry(session, {
+        type: 'user',
+        message: { role: 'user', content: prompt },
+      })
       setState(session, 'busy')
       try {
         engine.resetAbortController?.()

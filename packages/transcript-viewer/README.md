@@ -5,10 +5,15 @@ Claude Code 会话客户端，跨 iOS / iPad / Windows，从一处管理一支�
 三种使用方式：
 
 1. **本地查看**：导入 `~/.claude/projects/<项目>/<sessionId>.jsonl`，纯本地解析渲染（PWA，离线可用）。
-2. **远程只读/历史（relay）**：远端跑 `server/transcript_relay.py`，tail 已有 JSONL 经 devtunnel 推到客户端；输入靠按键注入裸 TUI。看历史会话最省事。
-3. **远程实时 + 结构化权限（daemon，推荐）**：远端在仓库内跑 `bun run server/run-daemon.ts`，用内部 QueryEngine 跑会话，权限走 `canUseTool` 结构化回调——**由 daemon 持有、广播全端、第一个客户端决定原子胜出**，彻底解决「本地 + 多端事先不知道谁先答」的并发问题。已在 Mac 上用真实会话验证（写命令触发权限→批准→真执行）。协议与对比见 `server/protocol.md`。
+2. **接管已开的终端会话（relay）**：远端跑 `server/transcript_relay.py`，它 **tail 你已经在终端里打开的 `claude` 会话** 的 JSONL、经 devtunnel 推到客户端；输入靠往那个真实的裸 TUI **注入按键**。适合「电脑上已经开着 Claude，想从手机接着看/操作」。
+3. **由客户端起会话（daemon，推荐）**：远端在仓库内跑 `bun run server/run-daemon.ts`，daemon **自己用内部 QueryEngine 跑会话**，权限走 `canUseTool` 结构化回调——**由 daemon 持有、广播全端、第一个客户端决定原子胜出**，解决「本地 + 多端事先不知道谁先答」的并发问题。已在 Mac 上用真实会话验证。协议与对比见 `server/protocol.md`。
 
-客户端首页是**舰队控制台**：列出所有机器、在线状态、跨机汇总的「等你处理」待办数（含等你授权），点进机器看会话列表，再点进会话即可实时查看、发送输入、回答 AskUserQuestion、**批准/拒绝工具权限**、中断。
+> **relay 与 daemon 的根本区别 —— 不要混淆：**
+> - **relay 接管「已存在」的终端会话**：你先在终端 `claude` 开会话，relay 把它镜像给手机。会话归终端，relay 只是个旁路。
+> - **daemon 没有终端窗口**：它**只列出、只控制自己创建的会话**。会话必须从客户端「新建会话」发起（`POST /api/sessions`），daemon 是唯一入口。你在终端里另开的 `claude` 对 daemon **不可见**——那是 relay 的活，不是 daemon 的。
+> - 想「控制终端里那个会话」用 relay；想「从手机/PC 起一个全新会话并全程控制」用 daemon。
+
+客户端首页是**舰队控制台**：列出所有机器、在线状态、跨机汇总的「等你处理」待办数（含等你授权），点进机器看会话列表（daemon 模式下需先**新建会话**），再点进会话即可实时查看、发送输入、回答 AskUserQuestion、**批准/拒绝工具权限**、中断。
 
 > 十几台机器的连接配置（含 token）可在「导入 / 导出」里一次导出、在其他设备粘贴导入，三端共用一份。
 
