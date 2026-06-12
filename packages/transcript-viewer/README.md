@@ -6,7 +6,7 @@ Claude Code 会话客户端，跨 iOS / iPad / Windows，从一处管理一支�
 
 1. **本地查看**：导入 `~/.claude/projects/<项目>/<sessionId>.jsonl`，纯本地解析渲染（PWA，离线可用）。
 2. **远程只读/历史（relay）**：远端跑 `server/transcript_relay.py`，tail 已有 JSONL 经 devtunnel 推到客户端；输入靠按键注入裸 TUI。看历史会话最省事。
-3. **远程实时 + 结构化权限（daemon，推荐）**：远端跑 `server/bridge-daemon.ts`，用 Agent SDK 跑会话，权限走 `canUseTool` 结构化回调——**由 daemon 持有、广播全端、第一个客户端决定原子胜出**，彻底解决「本地 + 多端事先不知道谁先答」的并发问题。协议与对比见 `server/protocol.md`。
+3. **远程实时 + 结构化权限（daemon，推荐）**：远端在仓库内跑 `bun run server/run-daemon.ts`，用内部 QueryEngine 跑会话，权限走 `canUseTool` 结构化回调——**由 daemon 持有、广播全端、第一个客户端决定原子胜出**，彻底解决「本地 + 多端事先不知道谁先答」的并发问题。已在 Mac 上用真实会话验证（写命令触发权限→批准→真执行）。协议与对比见 `server/protocol.md`。
 
 客户端首页是**舰队控制台**：列出所有机器、在线状态、跨机汇总的「等你处理」待办数（含等你授权），点进机器看会话列表，再点进会话即可实时查看、发送输入、回答 AskUserQuestion、**批准/拒绝工具权限**、中断。
 

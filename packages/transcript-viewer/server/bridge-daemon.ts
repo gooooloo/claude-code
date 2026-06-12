@@ -34,7 +34,6 @@ interface Args {
   host: string
   token: string
   mock: boolean
-  askAll: boolean
   verbose: boolean
 }
 
@@ -44,7 +43,6 @@ function parseArgs(argv: string[]): Args {
     host: '127.0.0.1',
     token: process.env.RELAY_TOKEN ?? '',
     mock: false,
-    askAll: false,
     verbose: false,
   }
   for (let i = 0; i < argv.length; i++) {
@@ -53,7 +51,6 @@ function parseArgs(argv: string[]): Args {
     else if (a === '--host') args.host = argv[++i]
     else if (a === '--token') args.token = argv[++i]
     else if (a === '--mock') args.mock = true
-    else if (a === '--ask-all') args.askAll = true
     else if (a === '--verbose') args.verbose = true
   }
   return args
@@ -378,84 +375,115 @@ async function startRealSession(
   }
   sessions.set(sessionKey(projectKey, sessionId), session)
 
-  const sdk = await import('@anthropic-ai/claude-agent-sdk')
+  // 内部 QueryEngine —— canUseTool 在此路径真正触发(实测:published SDK 子进程
+  // 不回调权限，QueryEngine 回调)。需 MACRO defines + feature flags，
+  // 故 daemon 必须经 run-daemon.ts 启动。
+  const { QueryEngine } = await import('../../../src/QueryEngine.ts')
+  const { getTools } = await import('../../../src/tools.ts')
+  const { getEmptyToolPermissionContext } = await import('../../../src/Tool.ts')
+  const { getDefaultAppState } = await import(
+    '../../../src/state/AppStateStore.ts'
+  )
+  const { FileStateCache } = await import(
+    '../../../src/utils/fileStateCache.ts'
+  )
 
-  // 流式输入队列:把客户端输入喂给 SDK 的 AsyncIterable<SDKUserMessage>
-  const inputQueue: string[] = [firstPrompt]
-  let notify: (() => void) | null = null
-  let closed = false
-  async function* promptStream() {
-    while (!closed) {
-      while (inputQueue.length > 0) {
-        const text = inputQueue.shift() as string
-        yield {
-          type: 'user' as const,
-          message: { role: 'user' as const, content: text },
-          parent_tool_use_id: null,
+  const permissionContext = getEmptyToolPermissionContext()
+  const tools = getTools(permissionContext)
+  // 空 permission context(不加载用户 allow 规则)→ 需权限的工具都走 canUseTool;
+  // 默认模式下内置只读放行仍生效(如只读 Bash)，这是期望行为。
+  // (偏保守:远程控制场景宁可多问，不漏放行。)
+  const appState = {
+    ...getDefaultAppState(),
+    toolPermissionContext: { ...permissionContext, mode: 'default' as const },
+  }
+
+  // 结构化权限回调:登记 pending + 广播全端 + 等第一个客户端，返回值交还引擎
+  const canUseTool = async (
+    tool: { name: string },
+    input: Record<string, unknown>,
+    _ctx: unknown,
+    _asst: unknown,
+    toolUseID: string,
+  ) => {
+    if (ARGS.verbose) console.log(`[perm] canUseTool: ${tool.name}`)
+    const decision = await requestPermission(session, tool.name, input, {
+      toolUseID,
+      title: permissionTitle(tool.name, input),
+      description: 'Claude 想使用工具',
+    })
+    return decision === 'allow'
+      ? { behavior: 'allow' as const, updatedInput: input }
+      : {
+          behavior: 'deny' as const,
+          message: '用户在客户端拒绝',
+          decisionReason: { type: 'mode' as const, mode: 'default' as const },
         }
-      }
-      await new Promise<void>(r => {
-        notify = r
-      })
-    }
-  }
-  session.pushInput = (text: string) => {
-    inputQueue.push(text)
-    notify?.()
   }
 
-  const q = sdk.query({
-    prompt: promptStream(),
-    options: {
-      cwd,
-      // 默认权限模式:已被 allow 规则覆盖的自动通过，其余走 canUseTool。
-      // --ask-all(开发/演示):额外不加载 settings 的 allow 规则，让每个工具都提示。
-      permissionMode: 'default',
-      ...(ARGS.askAll ? { settingSources: [] as never } : {}),
-      // 结构化权限回调。
-      // ⚠️ 实测发现:published SDK(@anthropic-ai/claude-agent-sdk 0.2.114)在本机
-      //   spawn claude 子进程时，需要权限的工具(如写文件)既不执行也不回调这里,
-      //   疑似 SDK 与 claude 二进制的权限控制协议版本不匹配。只读工具(cat 等)正常
-      //   执行并返回。→ 真正可靠的 canUseTool 通道是本 repo 内部的 QueryEngine
-      //   (src/services/acp/agent.ts 即用它 + toolPermissionContext)。详见 protocol.md。
-      canUseTool: async (toolName, input, ctx) => {
-        if (ARGS.verbose) console.log(`[perm] canUseTool 被调用: ${toolName}`)
-        const decision = await requestPermission(session, toolName, input, {
-          toolUseID: ctx.toolUseID,
-          title: ctx.title,
-          displayName: ctx.displayName,
-          description: ctx.description,
-        })
-        return decision === 'allow'
-          ? { behavior: 'allow', updatedInput: input }
-          : { behavior: 'deny', message: '用户在客户端拒绝' }
-      },
+  // 跨内部模块的结构化类型用 as any 桥接(daemon 不在 tsconfig，运行时已验证)
+  const engine = new QueryEngine({
+    cwd,
+    tools,
+    commands: [],
+    mcpClients: [],
+    agents: [],
+    canUseTool: canUseTool as any,
+    getAppState: () => appState,
+    setAppState: (f: (prev: typeof appState) => typeof appState) => {
+      Object.assign(appState, f(appState))
     },
-  })
+    readFileCache: new FileStateCache(500, 50 * 1024 * 1024),
+  } as any)
 
+  // 串行回合泵:每条输入起一个新 turn，串行执行(不并发跑两个 turn)
+  const turnQueue: string[] = [firstPrompt]
+  let running = false
+  const pump = async () => {
+    if (running) return
+    running = true
+    while (turnQueue.length > 0) {
+      const prompt = turnQueue.shift() as string
+      setState(session, 'busy')
+      try {
+        engine.resetAbortController?.()
+        for await (const msg of engine.submitMessage(prompt)) {
+          mapSdkMessage(session, msg)
+        }
+      } catch (err) {
+        if (ARGS.verbose) console.error('[qe] turn 出错', err)
+      }
+    }
+    running = false
+    setState(session, 'idle')
+  }
+
+  session.pushInput = (text: string) => {
+    turnQueue.push(text)
+    void pump()
+  }
   session.interrupt = () => {
     for (const [id] of session.pending)
       decidePermission(session, id, 'deny', 'interrupt')
-    void q.interrupt?.()
+    engine.interrupt?.()
   }
 
-  // 消费 SDK 消息流 → 映射为 JSONL 行下发
-  ;(async () => {
-    try {
-      for await (const msg of q) {
-        if (closed) break
-        mapSdkMessage(session, msg)
-      }
-    } catch (err) {
-      if (ARGS.verbose) console.error('[sdk] 会话出错', err)
-    } finally {
-      closed = true
-      notify?.()
-      setState(session, 'idle')
-    }
-  })()
-
+  void pump()
   return session
+}
+
+/** 给权限卡片一个可读标题 */
+function permissionTitle(
+  toolName: string,
+  input: Record<string, unknown>,
+): string {
+  for (const key of ['command', 'file_path', 'path', 'url', 'pattern']) {
+    const v = input[key]
+    if (typeof v === 'string' && v.trim()) {
+      return `允许 ${toolName}: ${v.trim().slice(0, 80)}?`
+    }
+  }
+  return `允许使用 ${toolName}?`
 }
 
 // SDK 的 SDKMessage → 客户端能解析的 JSONL 行(type:user/assistant + message.content)
@@ -686,6 +714,10 @@ if (ARGS.mock) {
     '/demo/project',
     '演示会话',
   )
+} else {
+  // 真实模式:解锁配置访问(QueryEngine 依赖)。mock 模式不需要。
+  const { enableConfigs } = await import('../../../src/utils/config.ts')
+  enableConfigs()
 }
 
 Bun.serve({

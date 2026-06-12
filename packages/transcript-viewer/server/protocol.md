@@ -130,17 +130,21 @@ App 端协议已预留：`RemoteSessionState` 可扩展 `permission_prompt`，�
 
 # 二、Daemon 协议（bridge-daemon.ts，推荐）
 
-参考实现：`bridge-daemon.ts`（Bun/TypeScript）。每台远端机器跑一份：
+参考实现：`bridge-daemon.ts`（Bun/TypeScript），**经 `run-daemon.ts` 启动**（它注入
+QueryEngine 需要的 MACRO defines + feature flags；直接 `bun run bridge-daemon.ts` 会
+`MACRO is not defined`）。在 repo 根目录、每台远端机器跑一份：
 
 ```powershell
-bun run server/bridge-daemon.ts --token <密钥> --port 19860
+# 在仓库内运行(需要 src/，因为用内部 QueryEngine)
+bun run packages/transcript-viewer/server/run-daemon.ts --token <密钥> --port 19860
 devtunnel host -p 19860 --allow-anonymous
-# 本机验证（不调真 SDK、不耗 API）：加 --mock
+# 本机验证(不跑真会话、不耗 API)：加 --mock
 ```
 
-需要远端机器已登录 Claude Code（SDK 复用其登录态）。客户端「添加机器」填 devtunnel 域名 + 密钥，
-用法与 relay 完全一致——daemon 复用 relay 的 `GET /api/sessions`、`/stream`(snapshot/append/state)、
-`POST /input`，会话消息同样以 JSONL 行下发，客户端的链重建/渲染不变。差异只在多了**权限通道**。
+需要远端机器已登录 Claude Code（QueryEngine 复用其登录态/配置）。客户端「添加机器」填 devtunnel
+域名 + 密钥，用法与 relay 一致——daemon 复用 relay 的 `GET /api/sessions`、`/stream`
+(snapshot/append/state)、`POST /input`，会话消息同样以 JSONL 行下发，客户端的链重建/渲染不变。
+差异只在多了**权限通道**。
 
 ## 设计原则
 
@@ -209,28 +213,36 @@ data: { "id", "behavior": "allow"|"deny", "by": "<胜者客户端标识>" }
 「裸 TUI 的原生权限框」无法成为并发响应者——这是 TUI 的硬限制，不是本设计的取舍。
 daemon 把权限移出 TUI、变成结构化回调，才换来真正对等的多端作答。
 
-## 真 SDK 验证状态（在 Mac 上实测）
+## 真实会话验证状态（在 Mac 上实测）
+
+daemon 用**本 repo 内部的 `QueryEngine`** 跑真实会话（不是 published SDK 子进程——后者实测不回调
+`canUseTool`）。`QueryEngine` 依赖 MACRO 编译期常量 + feature flags，故 daemon 必须经
+`run-daemon.ts` 启动（它注入 `-d MACRO.*` + `--feature`，同 `scripts/dev.ts`）。
 
 | 能力 | 状态 |
 |---|---|
 | 跨平台（Mac/Linux/Windows，daemon 无平台专用代码） | ✅ 在 Mac 上实测 |
-| 流式输入（客户端 prompt → SDK 多轮） | ✅ 真 SDK 跑通 |
-| SDK 消息 → JSONL 行 → 客户端渲染 | ✅ 真 SDK 跑通 |
-| 只读工具自动执行（如 `cat`，built-in readonly 放行） | ✅ 真 SDK 跑通 |
-| 权限仲裁 + 多端先到先得 + 客户端 UI | ✅ `--mock` 端到端跑通（双标签页 + curl） |
-| **`canUseTool` 结构化权限（真 SDK）** | ❌ **未触发**——见下 |
+| 流式输入 + 多轮（客户端 prompt → 串行 turn 泵） | ✅ 真实会话跑通 |
+| QueryEngine 消息 → JSONL 行 → 客户端渲染 | ✅ 真实会话跑通 |
+| **`canUseTool` 结构化权限触发** | ✅ **真实会话跑通**（写命令触发回调） |
+| 权限仲裁(先到先得) → 批准 → 工具真执行 → 回合继续 | ✅ 真实会话跑通（文件真创建） |
+| 连续多个工具权限（逐个 canUseTool） | ✅ 真实会话跑通 |
+| 多端先到先得 + 客户端 UI 置灰同步 | ✅ `--mock` 端到端（双标签页 + curl） |
 
-**关键发现**：published SDK（`@anthropic-ai/claude-agent-sdk@0.2.114`）在本机 spawn `claude`
-子进程时，**需要权限的工具（如写文件）既不执行也不回调 `canUseTool`**（只读工具正常）。
-疑似 SDK 与本机 `claude` 二进制的权限控制协议版本不匹配。
+> published SDK（`@anthropic-ai/claude-agent-sdk@0.2.114`）路径已弃用：实测它 spawn `claude`
+> 子进程时需权限的工具既不执行也不回调 `canUseTool`（只读工具正常），疑似版本握手问题。
+> 内部 QueryEngine 路径无此问题。
 
-**可靠的修法**：本 repo 自己的 ACP 实现（`src/services/acp/agent.ts`）用的是**内部 `QueryEngine`**
-（`QueryEngineConfig.canUseTool` + `appState.toolPermissionContext.mode`），不是 published SDK 的
-子进程路径——它的 `canUseTool` 是验证可用的。daemon 要拿到真实权限回调，应改接内部 QueryEngine
-（像 ACP 那样），或在你的部署机上核对 SDK 与 claude 版本握手。**仲裁/广播/UI 那套已与权限来源解耦，
-换成 QueryEngine 后直接复用。**
+## 权限范围
+
+daemon 用空 permission context（不加载用户 `settings.json` 的 allow 规则）+ `default` 模式：
+需权限的工具都走 `canUseTool`（推到客户端），内置只读放行（如只读 Bash）仍自动执行。
+偏保守——远程控制场景宁可多问，不漏放行。如需尊重用户 allow 规则减少提示，可改为从 settings
+构建 permission context。
 
 ## 已知边界
 
 - daemon 跑的会话不是你直接敲的裸 TUI；RDP 进机器时，在该机 localhost 开个客户端作答（与手机对称）。
-- AskUserQuestion / ExitPlanMode 也可经同一权限通道结构化呈现（mock 演示了 Bash 权限）。
+- 多会话并发跑 turn 时共享部分全局会话状态（transcript 持久化）；当前按"一次一个 turn"使用，
+  高并发同跑多 turn 是边界情况。
+- AskUserQuestion / ExitPlanMode 也经同一 `canUseTool` 通道（ExitPlanMode 在 ACP 里有专门处理）。
