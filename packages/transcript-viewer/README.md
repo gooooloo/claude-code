@@ -13,6 +13,13 @@ Claude Code 会话客户端，跨 iOS / iPad / Windows，从一处管理一支�
 > - **daemon 没有终端窗口**：它**只列出、只控制自己创建的会话**。会话必须从客户端「新建会话」发起（`POST /api/sessions`），daemon 是唯一入口。你在终端里另开的 `claude` 对 daemon **不可见**——那是 relay 的活，不是 daemon 的。
 > - 想「控制终端里那个会话」用 relay；想「从手机/PC 起一个全新会话并全程控制」用 daemon。
 
+> **为什么不用官方 Remote Control（`claude rc`）？** enterprise 账号本就不是 claude.ai 订阅，
+> 官方 bridge 第一道订阅闸即挡；即便自建服务器 + 环境变量绕过订阅闸，**组织若禁用了
+> remote control，第二道 policy 闸（`isPolicyAllowed('allow_remote_control')`）仍会挡死**
+> `claude rc` / `claude bridge` / REPL 内转移这三条入口。daemon 不走 bridge 机制、不碰这两道闸，
+> 是 enterprise 的可行路径。代码依据、合规提醒与远端测试步骤见
+> [`server/enterprise-remote-control.md`](server/enterprise-remote-control.md)。
+
 客户端首页是**舰队控制台**：列出所有机器、在线状态、跨机汇总的「等你处理」待办数（含等你授权），点进机器看会话列表（daemon 模式下需先**新建会话**），再点进会话即可实时查看、发送输入、回答 AskUserQuestion、**批准/拒绝工具权限**、中断。
 
 > 十几台机器的连接配置（含 token）可在「导入 / 导出」里一次导出、在其他设备粘贴导入，三端共用一份。
@@ -60,12 +67,26 @@ bun run tauri dev        # 本地开发：起 vite + 原生窗口
 
 ### 远端服务（每台机器一个）
 
+**daemon（推荐；enterprise 唯一可行路径）** —— 由客户端起会话、结构化权限：
+
+```powershell
+# 必须经 run-daemon.ts 启动(注入 QueryEngine 需要的 MACRO + feature flags)
+bun run packages/transcript-viewer/server/run-daemon.ts --token <密钥> --port 19860
+devtunnel host -p 19860 --allow-anonymous
+# 本机验证(不跑真会话、不耗 API)：加 --mock
+```
+
+**relay** —— 接管你已在终端开着的 `claude` 会话（只读看历史 + 按键注入，看不到权限框）：
+
 ```powershell
 python packages/transcript-viewer/server/transcript_relay.py --token <密钥> --port 19850
 devtunnel host -p 19850 --allow-anonymous
 ```
 
-手机 App「添加连接」填 devtunnel 域名和密钥即可。本机联调可加 `--dev-echo`（输入只打印不注入）。
+手机 App「添加连接」填 devtunnel 域名和密钥即可。relay 本机联调可加 `--dev-echo`（输入只打印不注入）。
+
+> enterprise 账号请优先用 daemon——官方 Remote Control 因订阅闸 + 组织 policy 闸不可用，
+> 原因见 [`server/enterprise-remote-control.md`](server/enterprise-remote-control.md)。
 
 ## 实现要点
 
@@ -77,5 +98,5 @@ devtunnel host -p 19850 --allow-anonymous
 
 - subagent sidechain 文件（`<sessionId>/subagents/agent-*.jsonl`）暂不关联展示，可作为独立文件导入查看。
 - 本地导入的会话仅存在内存中，刷新后需重新导入（远程连接配置会持久化）。
-- 远程输入注入需先在服务端绑定终端进程 PID（`server/protocol.md` 的 bind 流程）。
-- Permission 对话框暂不能从手机回应（不写入 transcript），两个候选方案见 `server/protocol.md` 的 v2 设计。
+- **relay** 模式：远程输入注入需先在服务端绑定终端进程 PID（`server/protocol.md` 的 bind 流程）；Permission 对话框看不到（不写入 transcript），无法从手机回应——这正是 daemon 模式存在的理由。
+- **daemon** 模式：权限/AskUserQuestion/ExitPlanMode 均可从手机回应（`canUseTool` 结构化通道，多端先到先得），已在 Mac 实测；但 daemon 不接管终端会话，只控制自己创建的会话。
